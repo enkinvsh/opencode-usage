@@ -233,4 +233,39 @@ describe("createClaudeRefreshLoop multi-account", () => {
 
     expect(vi.mocked(fetchOAuthUsage).mock.calls.length).toBe(1)
   })
+
+  it("does not reuse a previous account slot after auth.json switches accounts", async () => {
+    const previousUsage: OAuthUsageResponse = {
+      ...USAGE,
+      fiveHour: { utilization: 88, resetsAt: null },
+    }
+    let token = "tokA"
+    vi.mocked(listOpenCodeAuthFiles).mockReturnValue(["/d/auth.json"])
+    vi.mocked(readOpenCodeAuthFrom).mockImplementation(() => ({
+      accessToken: token,
+      refreshToken: "",
+      expiresAt: Date.now() + 3_600_000,
+    }))
+    vi.mocked(fetchOAuthProfile).mockImplementation(async (t) =>
+      t === "tokA"
+        ? { email: "a@x.com", name: "Alice", plan: null }
+        : { email: "b@x.com", name: "Bob", plan: null },
+    )
+    vi.mocked(fetchOAuthUsage).mockImplementation(async (t) =>
+      t === "tokA"
+        ? { status: "ok", usage: previousUsage }
+        : { status: "rate_limited" },
+    )
+
+    let captured: ClaudeAccount[] = []
+    const loop = createClaudeRefreshLoop((a) => { captured = a }, 30)
+    loop.start()
+    await vi.waitFor(() => expect(captured[0]?.data?.fiveHour?.utilization).toBe(88))
+
+    token = "tokB"
+    await vi.waitFor(() => expect(captured[0]?.label).toBe("Claude (auth.json, Bob)"))
+    loop.stop()
+
+    expect(captured[0]?.data).toBeNull()
+  })
 })
