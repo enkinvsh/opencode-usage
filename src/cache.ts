@@ -16,6 +16,8 @@ interface NamespaceEntry<T> {
 interface CacheFile {
   claude?: NamespaceEntry<unknown>
   codex?: NamespaceEntry<unknown>
+  claudeAccounts?: Record<string, NamespaceEntry<unknown>>
+  claudeActiveIdentity?: string
 }
 
 function readCacheFile(): CacheFile {
@@ -54,4 +56,21 @@ export function writeNamespacedCache<T>(ns: CacheNamespace, result: T): void {
     [ns]: { timestamp: Date.now(), result },
   }
   writeCacheFile(updated)
+}
+
+export function readClaudeAccountCache<T>(identity: string | null): T | null {
+  const file = readCacheFile()
+  const id = identity ?? file.claudeActiveIdentity
+  if (!id) return null
+  const entry = file.claudeAccounts?.[id] as NamespaceEntry<T> | undefined
+  if (!entry) return null
+  if (Date.now() - entry.timestamp > CACHE_MAX_AGE_MS) return null
+  if (entry.result === null || entry.result === undefined) return null
+  return entry.result
+}
+
+export function writeClaudeAccountCache<T>(identity: string, result: T): void {
+  const existing = readCacheFile()
+  const accounts = { ...(existing.claudeAccounts ?? {}), [identity]: { timestamp: Date.now(), result } }
+  writeCacheFile({ ...existing, claudeAccounts: accounts, claudeActiveIdentity: identity })
 }

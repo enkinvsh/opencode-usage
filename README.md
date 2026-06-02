@@ -84,12 +84,20 @@ opencode resolves the npm package on startup automatically.
 
 ### Claude
 
-Uses a 6-step fallback chain to fetch Claude usage data:
+**Multiple accounts.** If OpenCode auth files exist, one Claude section is shown per file —
+`auth.json` (current account) and `_auth.json` (previous account) — each labeled by the
+account's display name. Each account is fetched independently and keyed separately, so one
+account's data never appears under another. The active account's usage endpoint is sometimes
+rate limited (HTTP 429) while OpenCode is using it for inference; the plugin honors the
+server `Retry-After`, keeps that account's last known data during the cooldown, and never
+falls back to a different account.
+
+When no OpenCode auth file exists, a single Claude section is fetched via a 6-step fallback chain:
 
 ```
-1. CLAUDE_CODE_OAUTH_TOKEN env var        → OAuth API (all OS)
-2. ~/.claude/.credentials.json            → OAuth API (all OS)
-3. OpenCode auth.json + token refresh     → OAuth API (all OS)
+1. OpenCode auth.json + token refresh     → OAuth API (all OS)
+2. CLAUDE_CODE_OAUTH_TOKEN env var        → OAuth API (all OS)
+3. ~/.claude/.credentials.json            → OAuth API (all OS)
 4. macOS Keychain                         → OAuth API (macOS)
 5. Claude CLI PTY probe (/usage command)  → parse TUI output (macOS/Linux)
 6. Browser cookies (Chrome/Firefox)       → claude.ai Web API (macOS/Linux)

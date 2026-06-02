@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process"
-import { readFileSync } from "node:fs"
+import { readFileSync, existsSync } from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
 import type { OAuthCredentials } from "./types"
@@ -8,9 +8,11 @@ const KEYCHAIN_SERVICE = "Claude Code-credentials"
 const PROFILE_SCOPE = "user:profile"
 const EXPIRY_BUFFER_MS = 5 * 60 * 1000
 const CREDENTIALS_FILE = join(homedir(), ".claude", ".credentials.json")
-const OPENCODE_AUTH_FILE = process.platform === "win32"
-  ? join(process.env.APPDATA ?? join(homedir(), "AppData", "Roaming"), "opencode", "auth.json")
-  : join(process.env.XDG_DATA_HOME ?? join(homedir(), ".local", "share"), "opencode", "auth.json")
+const OPENCODE_DIR = process.platform === "win32"
+  ? join(process.env.APPDATA ?? join(homedir(), "AppData", "Roaming"), "opencode")
+  : join(process.env.XDG_DATA_HOME ?? join(homedir(), ".local", "share"), "opencode")
+const OPENCODE_AUTH_FILE = join(OPENCODE_DIR, "auth.json")
+const OPENCODE_SECONDARY_AUTH_FILE = join(OPENCODE_DIR, "_auth.json")
 const OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 const REFRESH_ENDPOINT = "https://platform.claude.com/v1/oauth/token"
 const REFRESH_TIMEOUT_MS = 10_000
@@ -48,9 +50,15 @@ export function readCredentialsFile(): OAuthCredentials | null {
   }
 }
 
-export function readOpenCodeAuth(): { accessToken: string; refreshToken: string; expiresAt: number } | null {
+export interface OpenCodeAuth {
+  accessToken: string
+  refreshToken: string
+  expiresAt: number
+}
+
+export function readOpenCodeAuthFrom(filePath: string): OpenCodeAuth | null {
   try {
-    const raw = readFileSync(OPENCODE_AUTH_FILE, "utf8")
+    const raw = readFileSync(filePath, "utf8")
     const data = JSON.parse(raw)
     const ant = data.anthropic
     if (!ant?.access) return null
@@ -62,6 +70,17 @@ export function readOpenCodeAuth(): { accessToken: string; refreshToken: string;
   } catch {
     return null
   }
+}
+
+export function readOpenCodeAuth(): OpenCodeAuth | null {
+  return readOpenCodeAuthFrom(OPENCODE_AUTH_FILE)
+}
+
+export function listOpenCodeAuthFiles(): string[] {
+  const files: string[] = []
+  if (existsSync(OPENCODE_AUTH_FILE)) files.push(OPENCODE_AUTH_FILE)
+  if (existsSync(OPENCODE_SECONDARY_AUTH_FILE)) files.push(OPENCODE_SECONDARY_AUTH_FILE)
+  return files
 }
 
 export async function refreshToken(refreshTokenStr: string): Promise<OAuthCredentials | null> {

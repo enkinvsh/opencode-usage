@@ -1,8 +1,8 @@
 /** @jsxImportSource @opentui/solid */
 import { createSignal } from "solid-js"
 import type { TuiPlugin, TuiPluginModule, TuiSlotContext } from "@opencode-ai/plugin/tui"
-import type { UsageState, CodexState, PluginOptions } from "./types"
-import { createRefreshLoop } from "./fetcher"
+import type { ClaudeAccount, CodexState, PluginOptions, OAuthUsageResponse } from "./types"
+import { createClaudeRefreshLoop } from "./fetcher"
 import { createCodexRefreshLoop } from "./codex-fetcher"
 import { formatRelativeTime, formatPercentage, formatBar, formatCost, windowLabel } from "./format"
 
@@ -37,17 +37,8 @@ const tui: TuiPlugin = async (api, rawOptions, _meta) => {
   const showCodex = options.showCodex !== false
   const codexHeaderColor = options.codexHeaderColor ?? CODEX_GREEN
 
-  const [claudeState, setClaudeState] = createSignal<UsageState>({
-    status: "idle",
-    data: null,
-    profile: null,
-    authMethod: "none",
-    error: null,
-  })
-  const [claudeOpen, setClaudeOpen] = createSignal(true)
-  const [claudeCountdown, setClaudeCountdown] = createSignal(EXPECTED_LOAD_S)
-  let claudeTickTimer: ReturnType<typeof setInterval> | null = null
-  let claudeCountdownStart = Date.now()
+  const [claudeAccounts, setClaudeAccounts] = createSignal<ClaudeAccount[]>([])
+  const [claudeCollapsed, setClaudeCollapsed] = createSignal<Record<string, boolean>>({})
 
   const [codexState, setCodexState] = createSignal<CodexState>({
     status: "idle",
@@ -60,23 +51,6 @@ const tui: TuiPlugin = async (api, rawOptions, _meta) => {
   const [codexCountdown, setCodexCountdown] = createSignal(EXPECTED_LOAD_S)
   let codexTickTimer: ReturnType<typeof setInterval> | null = null
   let codexCountdownStart = Date.now()
-
-  const wrappedSetClaudeState = (s: UsageState) => {
-    if (s.status === "loading" && !s.data) {
-      claudeCountdownStart = Date.now()
-      setClaudeCountdown(EXPECTED_LOAD_S)
-      if (!claudeTickTimer) {
-        claudeTickTimer = setInterval(() => {
-          const elapsed = Math.floor((Date.now() - claudeCountdownStart) / 1000)
-          setClaudeCountdown(Math.max(0, EXPECTED_LOAD_S - elapsed))
-        }, 1000)
-      }
-    } else if (claudeTickTimer) {
-      clearInterval(claudeTickTimer)
-      claudeTickTimer = null
-    }
-    setClaudeState(s)
-  }
 
   const wrappedSetCodexState = (s: CodexState) => {
     if (s.status === "loading" && !s.data) {
@@ -95,7 +69,7 @@ const tui: TuiPlugin = async (api, rawOptions, _meta) => {
     setCodexState(s)
   }
 
-  const claudeLoop = createRefreshLoop(wrappedSetClaudeState, refreshIntervalMs)
+  const claudeLoop = createClaudeRefreshLoop(setClaudeAccounts, refreshIntervalMs)
   const codexLoop = createCodexRefreshLoop(wrappedSetCodexState, refreshIntervalMs)
 
   if (showClaude) claudeLoop.start()
@@ -104,7 +78,6 @@ const tui: TuiPlugin = async (api, rawOptions, _meta) => {
   api.lifecycle.onDispose(() => {
     claudeLoop.stop()
     codexLoop.stop()
-    if (claudeTickTimer) clearInterval(claudeTickTimer)
     if (codexTickTimer) clearInterval(codexTickTimer)
   })
 
@@ -117,12 +90,79 @@ const tui: TuiPlugin = async (api, rawOptions, _meta) => {
         const fg = options.headerColor ?? t.text ?? "#EEFFFF"
         const valueFg = options.valueColor ?? "#82AAFF"
 
-        const renderClaude = () => {
-          const s = claudeState()
+        const renderClaudeWindows = (data: OAuthUsageResponse) => (
+          <box flexDirection="column">
+            {CLAUDE_WINDOW_KEYS.map((key) => {
+              const w = data[key as ClaudeWindowKey]
+              if (!w) return null
+              const pct = w.utilization
+              const label = windowLabel(key)
+              const pctColor = pct === null ? valueFg
+                : pct >= 80 ? CLAUDE_ORANGE
+                : pct >= 51 ? CLAUDE_AMBER
+                : valueFg
 
-          if (s.status === "not-configured") {
+              if (displayMode === "bar") {
+                const bar = formatBar(pct)
+                const resetStr = formatRelativeTime(w.resetsAt)
+                const resetSuffix = resetStr && resetStr !== "—" ? ` (${resetStr})` : ""
+                return (
+                  <box height={1} flexDirection="row">
+                    <text fg={fg}>{` ${label.padEnd(8)}`}</text>
+                    <text fg={pctColor}>{bar.filled + bar.empty + formatPercentage(pct).padStart(4)}</text>
+                    <text fg={dim}>{resetSuffix}</text>
+                  </box>
+                )
+              }
+
+              const resetStr = formatRelativeTime(w.resetsAt)
+              return (
+                <box height={1} flexDirection="row">
+                  <text fg={fg}>{` ${label.padEnd(9)}`}</text>
+                  <text fg={pctColor}>{formatPercentage(pct).padStart(5)}</text>
+                  <text fg={dim}>{`  resets in ${resetStr}`}</text>
+                </box>
+              )
+            })}
+
+            {data.extraUsage?.isEnabled ? (
+              <box height={1} flexDirection="row">
+                <text fg={fg}>{"Credit  "}</text>
+                <text fg={valueFg}>
+                  {formatCost(data.extraUsage.usedCredits, data.extraUsage.monthlyLimit, data.extraUsage.currency)}
+                </text>
+              </box>
+            ) : null}
+          </box>
+        )
+
+        const renderClaudeAccount = (acc: ClaudeAccount) => {
+          const isOpen = claudeCollapsed()[acc.id] !== true
+          const body = acc.status === "not-configured"
+            ? <box height={1}><text fg={dim}>{"Token invalid or expired"}</text></box>
+            : acc.status === "error"
+            ? <box height={1}><text fg={dim}>{"Failed to fetch usage"}</text></box>
+            : !acc.data
+            ? <box height={1}><text fg={dim}>{"Loading..."}</text></box>
+            : renderClaudeWindows(acc.data)
+
+          return (
+            <box flexDirection="column">
+              <box height={1} flexDirection="row" onMouseDown={() => setClaudeCollapsed({ ...claudeCollapsed(), [acc.id]: isOpen })}>
+                <text fg={CLAUDE_ORANGE}>
+                  <b>{isOpen ? "\u25BC" : "\u25B6"}{" "}{acc.label}</b>
+                </text>
+              </box>
+              {isOpen ? body : null}
+            </box>
+          )
+        }
+
+        const renderClaude = () => {
+          const accounts = claudeAccounts()
+          if (accounts.length === 0) {
             const hint = process.env.CLAUDE_CODE_OAUTH_TOKEN
-              ? "Token invalid or expired"
+              ? "Loading..."
               : "Set CLAUDE_CODE_OAUTH_TOKEN or run 'claude login'"
             return (
               <box flexDirection="column">
@@ -131,87 +171,9 @@ const tui: TuiPlugin = async (api, rawOptions, _meta) => {
               </box>
             )
           }
-
-          if (s.status === "error" && !s.data) {
-            return (
-              <box flexDirection="column">
-                <box height={1}><text fg={CLAUDE_ORANGE}><b>{"Claude Usage"}</b></text></box>
-                <box height={1}><text fg={dim}>{"Failed to fetch usage"}</text></box>
-              </box>
-            )
-          }
-
-          if ((s.status === "idle" || s.status === "loading") && !s.data) {
-            const remaining = claudeCountdown()
-            const msg = remaining > 0 ? `Loading in ${remaining}s...` : "Loading shortly..."
-            return (
-              <box flexDirection="column">
-                <box height={1}><text fg={CLAUDE_ORANGE}><b>{"Claude Usage"}</b></text></box>
-                <box height={1}><text fg={dim}>{msg}</text></box>
-              </box>
-            )
-          }
-
-          const data = s.data
-          const isOpen = claudeOpen()
-
           return (
-            <box flexDirection="column">
-              <box height={1} flexDirection="row" onMouseDown={() => setClaudeOpen(!claudeOpen())}>
-                <text fg={CLAUDE_ORANGE}>
-                  <b>{isOpen ? "\u25BC" : "\u25B6"}{" Claude Usage"}</b>
-                </text>
-              </box>
-
-              {isOpen ? (
-                <box flexDirection="column">
-                  {data ? (
-                    <box flexDirection="column">
-                      {CLAUDE_WINDOW_KEYS.map((key) => {
-                        const w = data[key as ClaudeWindowKey]
-                        if (!w) return null
-                        const pct = w.utilization
-                        const label = windowLabel(key)
-                        const pctColor = pct === null ? valueFg
-                          : pct >= 80 ? CLAUDE_ORANGE
-                          : pct >= 51 ? CLAUDE_AMBER
-                          : valueFg
-
-                        if (displayMode === "bar") {
-                          const bar = formatBar(pct)
-                          const resetStr = formatRelativeTime(w.resetsAt)
-                          const resetSuffix = resetStr && resetStr !== "—" ? ` (${resetStr})` : ""
-                          return (
-                            <box height={1} flexDirection="row">
-                              <text fg={fg}>{` ${label.padEnd(8)}`}</text>
-                              <text fg={pctColor}>{bar.filled + bar.empty + formatPercentage(pct).padStart(4)}</text>
-                              <text fg={dim}>{resetSuffix}</text>
-                            </box>
-                          )
-                        }
-
-                        const resetStr = formatRelativeTime(w.resetsAt)
-                        return (
-                          <box height={1} flexDirection="row">
-                            <text fg={fg}>{` ${label.padEnd(9)}`}</text>
-                            <text fg={pctColor}>{formatPercentage(pct).padStart(5)}</text>
-                            <text fg={dim}>{`  resets in ${resetStr}`}</text>
-                          </box>
-                        )
-                      })}
-
-                      {data.extraUsage?.isEnabled ? (
-                        <box height={1} flexDirection="row">
-                          <text fg={fg}>{"Credit  "}</text>
-                          <text fg={valueFg}>
-                            {formatCost(data.extraUsage.usedCredits, data.extraUsage.monthlyLimit, data.extraUsage.currency)}
-                          </text>
-                        </box>
-                      ) : null}
-                    </box>
-                  ) : null}
-                </box>
-              ) : null}
+            <box flexDirection="column" gap={1}>
+              {accounts.map(renderClaudeAccount)}
             </box>
           )
         }

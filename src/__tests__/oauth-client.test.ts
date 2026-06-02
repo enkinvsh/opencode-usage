@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest"
-import { snakeToCamel, fetchOAuthUsage } from "../oauth-client.js"
+import { snakeToCamel, fetchOAuthUsage, fetchOAuthProfile } from "../oauth-client.js"
 
 describe("snakeToCamel", () => {
   it("converts snake_case keys to camelCase", () => {
@@ -23,16 +23,19 @@ describe("fetchOAuthUsage", () => {
     vi.stubGlobal("fetch", vi.fn())
   })
 
-  it("returns null on 401 response", async () => {
+  it("returns auth_failed on 401 response", async () => {
     vi.mocked(fetch).mockResolvedValue(new Response(null, { status: 401 }))
-    const result = await fetchOAuthUsage("invalid-token")
-    expect(result).toBeNull()
+    expect(await fetchOAuthUsage("invalid-token")).toEqual({ status: "auth_failed" })
   })
 
-  it("returns null on 403 response", async () => {
+  it("returns auth_failed on 403 response", async () => {
     vi.mocked(fetch).mockResolvedValue(new Response(null, { status: 403 }))
-    const result = await fetchOAuthUsage("scope-missing-token")
-    expect(result).toBeNull()
+    expect(await fetchOAuthUsage("scope-missing-token")).toEqual({ status: "auth_failed" })
+  })
+
+  it("returns rate_limited on 429 response", async () => {
+    vi.mocked(fetch).mockResolvedValue(new Response(null, { status: 429 }))
+    expect(await fetchOAuthUsage("rate-limited-token")).toEqual({ status: "rate_limited" })
   })
 
   it("parses valid usage response with snake_case conversion", async () => {
@@ -42,8 +45,38 @@ describe("fetchOAuthUsage", () => {
     })
     vi.mocked(fetch).mockResolvedValue(new Response(rawBody, { status: 200 }))
     const result = await fetchOAuthUsage("valid-token")
-    expect(result).not.toBeNull()
-    expect(result?.fiveHour?.utilization).toBe(45)
-    expect(result?.sevenDay?.utilization).toBe(62)
+    expect(result.status).toBe("ok")
+    if (result.status === "ok") {
+      expect(result.usage.fiveHour?.utilization).toBe(45)
+      expect(result.usage.sevenDay?.utilization).toBe(62)
+    }
+  })
+})
+
+describe("fetchOAuthProfile", () => {
+  beforeEach(() => {
+    vi.stubGlobal("fetch", vi.fn())
+  })
+
+  it("extracts email and display name from the nested account object", async () => {
+    const rawBody = JSON.stringify({
+      account: { email: "primary@example.com", display_name: "Primary", full_name: "Primary Example" },
+      organization: { organization_type: "claude_max" },
+    })
+    vi.mocked(fetch).mockResolvedValue(new Response(rawBody, { status: 200 }))
+    const result = await fetchOAuthProfile("valid-token")
+    expect(result?.email).toBe("primary@example.com")
+    expect(result?.name).toBe("Primary")
+    expect(result?.plan).toBe("claude_max")
+  })
+
+  it("returns null when the account has no email", async () => {
+    vi.mocked(fetch).mockResolvedValue(new Response(JSON.stringify({ organization: {} }), { status: 200 }))
+    expect(await fetchOAuthProfile("token")).toBeNull()
+  })
+
+  it("returns null on 401", async () => {
+    vi.mocked(fetch).mockResolvedValue(new Response(null, { status: 401 }))
+    expect(await fetchOAuthProfile("token")).toBeNull()
   })
 })

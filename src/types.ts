@@ -23,9 +23,18 @@ export interface OAuthUsageResponse {
   extraUsage: OAuthExtraUsage | null
 }
 
+export type UsageFetchStatus = "ok" | "rate_limited" | "auth_failed" | "unavailable"
+
+export type UsageFetchResult =
+  | { status: "ok"; usage: OAuthUsageResponse }
+  | { status: "rate_limited"; retryAfterMs?: number }
+  | { status: "auth_failed" }
+  | { status: "unavailable" }
+
 // Profile response
 export interface ProfileResponse {
   email: string
+  name: string | null
   plan: string | null
 }
 
@@ -73,6 +82,16 @@ export interface UsageState {
   status: FetchStatus
   data: OAuthUsageResponse | null
   profile: ProfileResponse | null
+  authMethod: AuthMethod
+  error: string | null
+}
+
+// One displayable Claude account section (one per OpenCode auth file).
+export interface ClaudeAccount {
+  id: string
+  label: string
+  status: FetchStatus
+  data: OAuthUsageResponse | null
   authMethod: AuthMethod
   error: string | null
 }

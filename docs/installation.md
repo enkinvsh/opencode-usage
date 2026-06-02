@@ -127,14 +127,14 @@ The plugin tries Claude auth methods in this order:
 
 | Priority | Method | Platforms | Setup |
 |----------|--------|-----------|-------|
-| 1 | `CLAUDE_CODE_OAUTH_TOKEN` env var | All | Run `claude setup-token`, set env var |
-| 2 | `~/.claude/.credentials.json` | All | Automatic if Claude CLI stores credentials here |
-| 3 | OpenCode `auth.json` + token refresh | All | Automatic if logged in via opencode |
+| 1 | OpenCode `auth.json` + token refresh | All | Automatic if logged in via opencode |
+| 2 | `CLAUDE_CODE_OAUTH_TOKEN` env var | All | Run `claude setup-token`, set env var |
+| 3 | `~/.claude/.credentials.json` | All | Automatic if Claude CLI stores credentials here |
 | 4 | macOS Keychain | macOS | Automatic after `claude auth login` |
 | 5 | Claude CLI PTY probe | macOS, Linux | Automatic, requires Python3 |
 | 6 | Browser cookies (Chrome/Firefox) | macOS, Linux | Log into claude.ai in your browser |
 
-**Windows users**: Methods 1-3 work. Set `CLAUDE_CODE_OAUTH_TOKEN` for the most reliable experience.
+**Windows users**: Methods 1-3 work. The OpenCode `auth.json` path is preferred; set `CLAUDE_CODE_OAUTH_TOKEN` as a fallback for the most reliable experience.
 
 ### Codex
 

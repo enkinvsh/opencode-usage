@@ -62,3 +62,32 @@ describe("readNamespacedCache / writeNamespacedCache", () => {
     expect(readNamespacedCache("codex")).toBeNull()
   })
 })
+
+describe("readClaudeAccountCache / writeClaudeAccountCache", () => {
+  it("stores and reads usage keyed by account identity", async () => {
+    const { readClaudeAccountCache, writeClaudeAccountCache } = await import("../cache.js")
+    writeClaudeAccountCache("a@example.com", { weekly: 1 })
+    writeClaudeAccountCache("b@example.com", { weekly: 2 })
+    expect(readClaudeAccountCache<{ weekly: number }>("a@example.com")?.weekly).toBe(1)
+    expect(readClaudeAccountCache<{ weekly: number }>("b@example.com")?.weekly).toBe(2)
+  })
+
+  it("falls back to the active identity when none is given", async () => {
+    const { readClaudeAccountCache, writeClaudeAccountCache } = await import("../cache.js")
+    writeClaudeAccountCache("a@example.com", { weekly: 1 })
+    writeClaudeAccountCache("b@example.com", { weekly: 2 })
+    expect(readClaudeAccountCache<{ weekly: number }>(null)?.weekly).toBe(2)
+  })
+
+  it("returns null for an unknown identity", async () => {
+    const { readClaudeAccountCache, writeClaudeAccountCache } = await import("../cache.js")
+    writeClaudeAccountCache("a@example.com", { weekly: 1 })
+    expect(readClaudeAccountCache("missing@example.com")).toBeNull()
+  })
+
+  it("does not serve another account's data", async () => {
+    const { readClaudeAccountCache, writeClaudeAccountCache } = await import("../cache.js")
+    writeClaudeAccountCache("old@example.com", { weekly: 99 })
+    expect(readClaudeAccountCache<{ weekly: number }>("new@example.com")).toBeNull()
+  })
+})

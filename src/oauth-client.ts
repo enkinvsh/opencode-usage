@@ -1,4 +1,4 @@
-import type { OAuthUsageResponse, ProfileResponse } from "./types"
+import type { OAuthUsageResponse, ProfileResponse, UsageFetchResult } from "./types"
 
 const BASE_URL = "https://api.anthropic.com"
 const BETA_HEADER = "oauth-2025-04-20"
@@ -49,21 +49,36 @@ export function snakeToCamel(obj: unknown): unknown {
 
 /**
  * Fetch Claude usage data via OAuth API.
- * Requires user:profile scope — returns null on 401/403.
+ *
+ * Distinguishes HTTP 429 (transient rate limit, common when the same account is
+ * actively used for inference) from auth failures (401/403). The caller relies on
+ * this to avoid falling through to a DIFFERENT account's token on a transient 429.
  */
-export async function fetchOAuthUsage(accessToken: string): Promise<OAuthUsageResponse | null> {
-  try {
-    const response = await fetchWithTimeout(
-      `${BASE_URL}/api/oauth/usage`,
-      makeHeaders(accessToken),
-    )
-    if (!response || !response.ok) return null
-
-    const raw = await response.json() as Record<string, unknown>
-    return snakeToCamel(raw) as OAuthUsageResponse
-  } catch {
-    return null
+export async function fetchOAuthUsage(accessToken: string): Promise<UsageFetchResult> {
+  const response = await fetchWithTimeout(
+    `${BASE_URL}/api/oauth/usage`,
+    makeHeaders(accessToken),
+  )
+  if (!response) return { status: "unavailable" }
+  if (response.status === 429) {
+    const retryAfterSec = Number(response.headers.get("retry-after"))
+    return Number.isFinite(retryAfterSec) && retryAfterSec > 0
+      ? { status: "rate_limited", retryAfterMs: retryAfterSec * 1000 }
+      : { status: "rate_limited" }
   }
+  if (response.status === 401 || response.status === 403) return { status: "auth_failed" }
+  if (!response.ok) return { status: "unavailable" }
+
+  try {
+    const raw = await response.json() as Record<string, unknown>
+    return { status: "ok", usage: snakeToCamel(raw) as OAuthUsageResponse }
+  } catch {
+    return { status: "unavailable" }
+  }
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return value !== null && typeof value === "object" ? value as Record<string, unknown> : {}
 }
 
 export async function fetchOAuthProfile(accessToken: string): Promise<ProfileResponse | null> {
@@ -77,13 +92,22 @@ export async function fetchOAuthProfile(accessToken: string): Promise<ProfileRes
     const raw = await response.json() as Record<string, unknown>
     const converted = snakeToCamel(raw) as Record<string, unknown>
 
-    const email = typeof converted.email === "string" ? converted.email : null
+    // The OAuth profile nests identity under `account` (account.email, account.display_name);
+    // older callers read the top level, which is always empty for the real API response.
+    const account = asRecord(converted.account ?? converted)
+    const organization = asRecord(converted.organization)
+
+    const email = typeof account.email === "string" ? account.email : null
     if (!email) return null
 
-    return {
-      email,
-      plan: typeof converted.subscriptionType === "string" ? converted.subscriptionType : null,
-    }
+    const name = typeof account.displayName === "string" ? account.displayName
+      : typeof account.fullName === "string" ? account.fullName
+      : null
+    const plan = typeof organization.organizationType === "string" ? organization.organizationType
+      : typeof account.subscriptionType === "string" ? account.subscriptionType
+      : null
+
+    return { email, name, plan }
   } catch {
     return null
   }
