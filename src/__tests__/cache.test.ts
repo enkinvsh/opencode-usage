@@ -90,4 +90,20 @@ describe("readClaudeAccountCache / writeClaudeAccountCache", () => {
     writeClaudeAccountCache("old@example.com", { weekly: 99 })
     expect(readClaudeAccountCache<{ weekly: number }>("new@example.com")).toBeNull()
   })
+
+  it("stores and reads usage by auth-file cache key", async () => {
+    const { readClaudeAccountKeyCache, writeClaudeAccountKeyCache } = await import("../cache.js")
+    writeClaudeAccountKeyCache("auth-key-a", { session: 81 })
+    writeClaudeAccountKeyCache("auth-key-b", { session: 12 })
+    expect(readClaudeAccountKeyCache<{ session: number }>("auth-key-a")?.session).toBe(81)
+    expect(readClaudeAccountKeyCache<{ session: number }>("auth-key-b")?.session).toBe(12)
+  })
+
+  it("returns auth-file cache entries with timestamps", async () => {
+    const { readClaudeAccountKeyCacheEntry, writeClaudeAccountKeyCache } = await import("../cache.js")
+    writeClaudeAccountKeyCache("auth-key-a", { session: 81 })
+    const entry = readClaudeAccountKeyCacheEntry<{ session: number }>("auth-key-a")
+    expect(entry?.result.session).toBe(81)
+    expect(typeof entry?.timestamp).toBe("number")
+  })
 })

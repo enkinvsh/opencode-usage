@@ -3,7 +3,7 @@ import { readKeychainCredentials, readCredentialsFile, readOpenCodeAuth, readOpe
 import { fetchOAuthUsage, fetchOAuthProfile } from "./oauth-client"
 import { extractSessionKey, fetchWebUsage } from "./cookie-reader"
 import { detectClaude, probeCLIUsage, probeStatus } from "./cli-probe"
-import { readClaudeAccountCache, writeClaudeAccountCache } from "./cache"
+import { readClaudeAccountCache, readClaudeAccountKeyCacheEntry, writeClaudeAccountCache, writeClaudeAccountKeyCache } from "./cache"
 import type { OAuthUsageResponse, ProfileResponse, AuthMethod, UsageFetchStatus, ClaudeAccount } from "./types"
 
 interface FetchResult {
@@ -15,14 +15,18 @@ interface FetchResult {
   retryAfterMs?: number
 }
 
+const CLAUDE_ACCOUNT_MIN_FETCH_INTERVAL_MS = 60_000
+
 function readCache(identity: string | null): FetchResult | null {
   const cached = readClaudeAccountCache<FetchResult>(identity)
   if (!cached?.usage) return null
   return cached
 }
 
-function writeCache(result: FetchResult): void {
-  if (result.usage && result.identity) writeClaudeAccountCache(result.identity, result)
+function writeCache(result: FetchResult, accountKey?: string): void {
+  if (!result.usage) return
+  if (result.identity) writeClaudeAccountCache(result.identity, result)
+  if (accountKey) writeClaudeAccountKeyCache(accountKey, result)
 }
 
 /**
@@ -47,9 +51,17 @@ const failedTokens = new Set<string>()
 interface RefreshedTokenCache {
   sourceAccessToken: string
   accessToken: string
+  expiresAt: number
 }
 
 let lastRefreshedToken: RefreshedTokenCache | null = null
+
+function validRefreshedAccessToken(cached: RefreshedTokenCache | null | undefined, sourceAccessToken: string): string | null {
+  if (!cached) return null
+  if (cached.sourceAccessToken !== sourceAccessToken) return null
+  if (isTokenExpired(cached.expiresAt)) return null
+  return cached.accessToken
+}
 
 interface OAuthAttempt {
   usage: OAuthUsageResponse | null
@@ -106,16 +118,14 @@ export async function fetchUsageData(): Promise<FetchResult> {
     ocAuth = readOpenCodeAuth()
   } catch {}
   if (ocAuth) {
-    const refreshedAccessToken = lastRefreshedToken?.sourceAccessToken === ocAuth.accessToken
-      ? lastRefreshedToken.accessToken
-      : null
+    const refreshedAccessToken = validRefreshedAccessToken(lastRefreshedToken, ocAuth.accessToken)
     let token = refreshedAccessToken ?? ocAuth.accessToken
     if (!refreshedAccessToken && isTokenExpired(ocAuth.expiresAt) && ocAuth.refreshToken) {
       try {
         const refreshed = await refreshToken(ocAuth.refreshToken)
         if (refreshed) {
           token = refreshed.accessToken
-          lastRefreshedToken = { sourceAccessToken: ocAuth.accessToken, accessToken: token }
+          lastRefreshedToken = { sourceAccessToken: ocAuth.accessToken, accessToken: token, expiresAt: refreshed.expiresAt }
         }
       } catch {}
     }
@@ -226,6 +236,16 @@ function accountStateKey(filePath: string, accessToken: string): string {
   return `${filePath}\0${tokenHash}`
 }
 
+function accountCacheKey(stateKey: string): string {
+  return createHash("sha256").update(stateKey).digest("hex")
+}
+
+function readAccountKeyCache(accountKey: string) {
+  const cached = readClaudeAccountKeyCacheEntry<FetchResult>(accountKey)
+  if (!cached?.result.usage) return null
+  return cached
+}
+
 /**
  * Fetch usage for a single OpenCode auth file (one Claude account). Each file is a distinct
  * account, so this never falls back to other auth sources. A transient 429 is surfaced
@@ -236,16 +256,14 @@ async function fetchAccountUsage(filePath: string, auth = readOpenCodeAuthFrom(f
     return { usage: null, profile: null, authMethod: "none", identity: null, usageStatus: "unavailable" }
   }
   const cachedRefresh = refreshedTokens.get(filePath)
-  const refreshedAccessToken = cachedRefresh?.sourceAccessToken === auth.accessToken
-    ? cachedRefresh.accessToken
-    : null
+  const refreshedAccessToken = validRefreshedAccessToken(cachedRefresh, auth.accessToken)
   let token = refreshedAccessToken ?? auth.accessToken
   if (!refreshedAccessToken && isTokenExpired(auth.expiresAt) && auth.refreshToken) {
     try {
       const refreshed = await refreshToken(auth.refreshToken)
       if (refreshed) {
         token = refreshed.accessToken
-        refreshedTokens.set(filePath, { sourceAccessToken: auth.accessToken, accessToken: token })
+        refreshedTokens.set(filePath, { sourceAccessToken: auth.accessToken, accessToken: token, expiresAt: refreshed.expiresAt })
       }
     } catch {}
   }
@@ -277,6 +295,7 @@ export function createClaudeRefreshLoop(
   const slots = new Map<string, AccountSlot>()
   const lastProfiles = new Map<string, ProfileResponse>()
   const rateLimitedUntil = new Map<string, number>()
+  const lastRequestedAt = new Map<string, number>()
 
   function labelFor(id: string, stateKey: string, profile: ProfileResponse | null, override?: string): string {
     if (override) return override
@@ -293,13 +312,23 @@ export function createClaudeRefreshLoop(
     if (!auth) return toAccount(file, file, { usage: null, profile: null, authMethod: "none", identity: null, usageStatus: "unavailable" })
 
     const stateKey = accountStateKey(file, auth.accessToken)
+    const cacheKey = accountCacheKey(stateKey)
+    const cached = readAccountKeyCache(cacheKey)
+    const cachedSlot = hydrateSlotFromCache(stateKey, cached)
+    const now = Date.now()
     if (Date.now() < (rateLimitedUntil.get(stateKey) ?? 0)) {
-      const slot = slots.get(stateKey)
-      if (slot) {
-        return { id: file, label: labelFor(file, stateKey, null), status: "success", data: slot.data, authMethod: slot.authMethod, error: null }
+      if (cachedSlot) {
+        return accountFromSlot(file, stateKey, cachedSlot)
       }
       return { id: file, label: labelFor(file, stateKey, null), status: "loading", data: null, authMethod: "none", error: null }
     }
+
+    const lastRequest = lastRequestedAt.get(stateKey) ?? cached?.timestamp ?? 0
+    if (cachedSlot && now - lastRequest < CLAUDE_ACCOUNT_MIN_FETCH_INTERVAL_MS) {
+      return accountFromSlot(file, stateKey, cachedSlot)
+    }
+
+    lastRequestedAt.set(stateKey, now)
     const result = await fetchAccountUsage(file, auth)
     if (result.profile) lastProfiles.set(stateKey, result.profile)
     if (result.usageStatus === "rate_limited") {
@@ -307,13 +336,28 @@ export function createClaudeRefreshLoop(
     } else {
       rateLimitedUntil.delete(stateKey)
     }
-    return toAccount(file, stateKey, result)
+    return toAccount(file, stateKey, result, undefined, cacheKey)
   }
 
-  function toAccount(id: string, stateKey: string, result: FetchResult, labelOverride?: string): ClaudeAccount {
+  function hydrateSlotFromCache(stateKey: string, cached: ReturnType<typeof readAccountKeyCache>): AccountSlot | null {
+    const existing = slots.get(stateKey)
+    if (existing) return existing
+    const usage = cached?.result.usage
+    if (!usage) return null
+    const slot = { data: usage, profile: cached.result.profile, authMethod: cached.result.authMethod }
+    slots.set(stateKey, slot)
+    if (cached.result.profile) lastProfiles.set(stateKey, cached.result.profile)
+    return slot
+  }
+
+  function accountFromSlot(id: string, stateKey: string, slot: AccountSlot, labelOverride?: string): ClaudeAccount {
+    return { id, label: labelFor(id, stateKey, slot.profile, labelOverride), status: "success", data: slot.data, authMethod: slot.authMethod, error: null }
+  }
+
+  function toAccount(id: string, stateKey: string, result: FetchResult, labelOverride?: string, accountKey?: string): ClaudeAccount {
     if (result.usage) {
       slots.set(stateKey, { data: result.usage, profile: result.profile, authMethod: result.authMethod })
-      writeCache(result)
+      writeCache(result, accountKey)
       return { id, label: labelFor(id, stateKey, result.profile, labelOverride), status: "success", data: result.usage, authMethod: result.authMethod, error: null }
     }
     if (result.authMethod === "none") {
@@ -324,9 +368,14 @@ export function createClaudeRefreshLoop(
     if (slot) {
       return { id, label: labelFor(id, stateKey, result.profile, labelOverride), status: "success", data: slot.data, authMethod: slot.authMethod, error: null }
     }
+    const keyCached = accountKey ? readAccountKeyCache(accountKey) : null
+    const keySlot = hydrateSlotFromCache(stateKey, keyCached)
+    if (keySlot) return accountFromSlot(id, stateKey, keySlot, labelOverride)
+
     const cached = result.identity ? readCache(result.identity) : null
     if (cached?.usage) {
       slots.set(stateKey, { data: cached.usage, profile: cached.profile, authMethod: cached.authMethod })
+      writeCache(cached, accountKey)
       return { id, label: labelFor(id, stateKey, cached.profile ?? result.profile, labelOverride), status: "success", data: cached.usage, authMethod: cached.authMethod, error: null }
     }
     if (result.usageStatus === "auth_failed") {

@@ -24,13 +24,16 @@ vi.mock("../cli-probe.js", () => ({
 }))
 vi.mock("../cache.js", () => ({
   readClaudeAccountCache: vi.fn(() => null),
+  readClaudeAccountKeyCacheEntry: vi.fn(() => null),
   writeClaudeAccountCache: vi.fn(),
+  writeClaudeAccountKeyCache: vi.fn(),
 }))
 
 import { readKeychainCredentials, readCredentialsFile, readOpenCodeAuth, readOpenCodeAuthFrom, listOpenCodeAuthFiles, refreshToken, isTokenExpired } from "../keychain.js"
 import { fetchOAuthUsage, fetchOAuthProfile } from "../oauth-client.js"
 import { extractSessionKey, fetchWebUsage } from "../cookie-reader.js"
 import { detectClaude, probeCLIUsage, probeStatus } from "../cli-probe.js"
+import { readClaudeAccountCache, readClaudeAccountKeyCacheEntry } from "../cache.js"
 import { fetchUsageData, createClaudeRefreshLoop } from "../fetcher.js"
 import type { OAuthUsageResponse, ClaudeAccount } from "../types.js"
 
@@ -47,6 +50,9 @@ const USAGE: OAuthUsageResponse = {
 
 describe("fetchUsageData fallback chain", () => {
   beforeEach(() => {
+    vi.clearAllMocks()
+    vi.mocked(readClaudeAccountCache).mockReturnValue(null)
+    vi.mocked(readClaudeAccountKeyCacheEntry).mockReturnValue(null)
     vi.mocked(readKeychainCredentials).mockResolvedValue(null)
     vi.mocked(readCredentialsFile).mockReturnValue(null)
     vi.mocked(readOpenCodeAuth).mockReturnValue(null)
@@ -136,6 +142,43 @@ describe("fetchUsageData fallback chain", () => {
     expect(fetchOAuthUsage).not.toHaveBeenCalledWith("file-token")
   })
 
+  it("refreshes OpenCode auth.json token again after the cached refreshed token expires", async () => {
+    vi.mocked(readOpenCodeAuth).mockReturnValue({
+      accessToken: "expired-source-token",
+      refreshToken: "opencode-refresh",
+      expiresAt: 1,
+    })
+    vi.mocked(isTokenExpired).mockReturnValue(true)
+    vi.mocked(refreshToken)
+      .mockResolvedValueOnce({
+        accessToken: "fresh-token-1",
+        refreshToken: "opencode-refresh",
+        expiresAt: 2,
+        scopes: [],
+        subscriptionType: null,
+        rateLimitTier: null,
+        hasProfileScope: false,
+      })
+      .mockResolvedValueOnce({
+        accessToken: "fresh-token-2",
+        refreshToken: "opencode-refresh",
+        expiresAt: 3,
+        scopes: [],
+        subscriptionType: null,
+        rateLimitTier: null,
+        hasProfileScope: false,
+      })
+    vi.mocked(fetchOAuthProfile).mockResolvedValue({ email: "primary@example.com", name: "Primary", plan: null })
+    vi.mocked(fetchOAuthUsage).mockResolvedValue({ status: "ok", usage: USAGE })
+
+    await fetchUsageData()
+    await fetchUsageData()
+
+    expect(refreshToken).toHaveBeenCalledTimes(2)
+    expect(fetchOAuthUsage).toHaveBeenNthCalledWith(1, "fresh-token-1")
+    expect(fetchOAuthUsage).toHaveBeenNthCalledWith(2, "fresh-token-2")
+  })
+
   it("does not fall through to a different account when OpenCode usage is rate limited", async () => {
     vi.mocked(readOpenCodeAuth).mockReturnValue({
       accessToken: "opencode-token",
@@ -173,6 +216,9 @@ describe("fetchUsageData fallback chain", () => {
 
 describe("createClaudeRefreshLoop multi-account", () => {
   beforeEach(() => {
+    vi.clearAllMocks()
+    vi.mocked(readClaudeAccountCache).mockReturnValue(null)
+    vi.mocked(readClaudeAccountKeyCacheEntry).mockReturnValue(null)
     vi.mocked(readOpenCodeAuthFrom).mockImplementation((p) => ({
       accessToken: p.endsWith("_auth.json") ? "tokB" : "tokA",
       refreshToken: "",
@@ -232,6 +278,46 @@ describe("createClaudeRefreshLoop multi-account", () => {
     loop.stop()
 
     expect(vi.mocked(fetchOAuthUsage).mock.calls.length).toBe(1)
+  })
+
+  it("renders fresh auth-file cache without querying the usage endpoint", async () => {
+    const cachedUsage: OAuthUsageResponse = {
+      ...USAGE,
+      fiveHour: { utilization: 77, resetsAt: null },
+    }
+    const cachedResult = {
+      usage: cachedUsage,
+      profile: { email: "a@x.com", name: "Alice", plan: null },
+      authMethod: "oauth" as const,
+      identity: "a@x.com",
+      usageStatus: "ok" as const,
+    }
+    vi.mocked(listOpenCodeAuthFiles).mockReturnValue(["/d/auth.json"])
+    vi.mocked(readClaudeAccountKeyCacheEntry).mockReturnValue({ timestamp: Date.now(), result: cachedResult })
+    vi.mocked(fetchOAuthUsage).mockResolvedValue({ status: "rate_limited" })
+
+    let captured: ClaudeAccount[] = []
+    const loop = createClaudeRefreshLoop((a) => { captured = a }, 30)
+    loop.start()
+    await vi.waitFor(() => expect(captured[0]?.data?.fiveHour?.utilization).toBe(77))
+    loop.stop()
+
+    expect(captured[0]?.label).toBe("Claude (auth.json, Alic)")
+    expect(fetchOAuthUsage).not.toHaveBeenCalled()
+  })
+
+  it("does not re-query a successful account inside the minimum fetch interval", async () => {
+    vi.mocked(listOpenCodeAuthFiles).mockReturnValue(["/d/auth.json"])
+    vi.mocked(fetchOAuthUsage).mockResolvedValue({ status: "ok", usage: USAGE })
+
+    let captured: ClaudeAccount[] = []
+    const loop = createClaudeRefreshLoop((a) => { captured = a }, 20)
+    loop.start()
+    await vi.waitFor(() => expect(captured[0]?.data).not.toBeNull())
+    await new Promise((r) => setTimeout(r, 120))
+    loop.stop()
+
+    expect(fetchOAuthUsage).toHaveBeenCalledTimes(1)
   })
 
   it("does not reuse a previous account slot after auth.json switches accounts", async () => {
