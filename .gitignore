@@ -2,6 +2,7 @@
 .DS_Store
 
 # AI
+.omo/
 .sisyphus
 AGENTS.md
 findings.md
