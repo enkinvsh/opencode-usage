@@ -23,10 +23,10 @@ function readCache(identity: string | null): FetchResult | null {
   return cached
 }
 
-function writeCache(result: FetchResult, accountKey?: string): void {
+function writeCache(result: FetchResult, accountKeys?: readonly string[]): void {
   if (!result.usage) return
   if (result.identity) writeClaudeAccountCache(result.identity, result)
-  if (accountKey) writeClaudeAccountKeyCache(accountKey, result)
+  for (const key of accountKeys ?? []) writeClaudeAccountKeyCache(key, result)
 }
 
 /**
@@ -240,10 +240,16 @@ function accountCacheKey(stateKey: string): string {
   return createHash("sha256").update(stateKey).digest("hex")
 }
 
-function readAccountKeyCache(accountKey: string) {
-  const cached = readClaudeAccountKeyCacheEntry<FetchResult>(accountKey)
-  if (!cached?.result.usage) return null
-  return cached
+function tokenCacheKey(accessToken: string): string {
+  return `token:${createHash("sha256").update(accessToken).digest("hex")}`
+}
+
+function readAccountKeyCache(accountKeys: readonly string[]) {
+  for (const key of accountKeys) {
+    const cached = readClaudeAccountKeyCacheEntry<FetchResult>(key)
+    if (cached?.result.usage) return cached
+  }
+  return null
 }
 
 /**
@@ -312,8 +318,8 @@ export function createClaudeRefreshLoop(
     if (!auth) return toAccount(file, file, { usage: null, profile: null, authMethod: "none", identity: null, usageStatus: "unavailable" })
 
     const stateKey = accountStateKey(file, auth.accessToken)
-    const cacheKey = accountCacheKey(stateKey)
-    const cached = readAccountKeyCache(cacheKey)
+    const cacheKeys = [tokenCacheKey(auth.accessToken), accountCacheKey(stateKey)]
+    const cached = readAccountKeyCache(cacheKeys)
     const cachedSlot = hydrateSlotFromCache(stateKey, cached)
     const now = Date.now()
     if (Date.now() < (rateLimitedUntil.get(stateKey) ?? 0)) {
@@ -336,7 +342,7 @@ export function createClaudeRefreshLoop(
     } else {
       rateLimitedUntil.delete(stateKey)
     }
-    return toAccount(file, stateKey, result, undefined, cacheKey)
+    return toAccount(file, stateKey, result, undefined, cacheKeys)
   }
 
   function hydrateSlotFromCache(stateKey: string, cached: ReturnType<typeof readAccountKeyCache>): AccountSlot | null {
@@ -354,10 +360,10 @@ export function createClaudeRefreshLoop(
     return { id, label: labelFor(id, stateKey, slot.profile, labelOverride), status: "success", data: slot.data, authMethod: slot.authMethod, error: null }
   }
 
-  function toAccount(id: string, stateKey: string, result: FetchResult, labelOverride?: string, accountKey?: string): ClaudeAccount {
+  function toAccount(id: string, stateKey: string, result: FetchResult, labelOverride?: string, accountKeys?: readonly string[]): ClaudeAccount {
     if (result.usage) {
       slots.set(stateKey, { data: result.usage, profile: result.profile, authMethod: result.authMethod })
-      writeCache(result, accountKey)
+      writeCache(result, accountKeys)
       return { id, label: labelFor(id, stateKey, result.profile, labelOverride), status: "success", data: result.usage, authMethod: result.authMethod, error: null }
     }
     if (result.authMethod === "none") {
@@ -368,14 +374,14 @@ export function createClaudeRefreshLoop(
     if (slot) {
       return { id, label: labelFor(id, stateKey, result.profile, labelOverride), status: "success", data: slot.data, authMethod: slot.authMethod, error: null }
     }
-    const keyCached = accountKey ? readAccountKeyCache(accountKey) : null
+    const keyCached = accountKeys ? readAccountKeyCache(accountKeys) : null
     const keySlot = hydrateSlotFromCache(stateKey, keyCached)
     if (keySlot) return accountFromSlot(id, stateKey, keySlot, labelOverride)
 
     const cached = result.identity ? readCache(result.identity) : null
     if (cached?.usage) {
       slots.set(stateKey, { data: cached.usage, profile: cached.profile, authMethod: cached.authMethod })
-      writeCache(cached, accountKey)
+      writeCache(cached, accountKeys)
       return { id, label: labelFor(id, stateKey, cached.profile ?? result.profile, labelOverride), status: "success", data: cached.usage, authMethod: cached.authMethod, error: null }
     }
     if (result.usageStatus === "auth_failed") {

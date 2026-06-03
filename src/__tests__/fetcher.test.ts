@@ -306,6 +306,40 @@ describe("createClaudeRefreshLoop multi-account", () => {
     expect(fetchOAuthUsage).not.toHaveBeenCalled()
   })
 
+  it("reuses a token cache when an account moves from auth.json to _auth.json and profile is unavailable", async () => {
+    const cachedUsage: OAuthUsageResponse = {
+      ...USAGE,
+      fiveHour: { utilization: 64, resetsAt: null },
+    }
+    const cachedResult = {
+      usage: cachedUsage,
+      profile: { email: "b@x.com", name: "Bob", plan: null },
+      authMethod: "oauth" as const,
+      identity: "b@x.com",
+      usageStatus: "ok" as const,
+    }
+    vi.mocked(listOpenCodeAuthFiles).mockReturnValue(["/d/_auth.json"])
+    vi.mocked(readOpenCodeAuthFrom).mockReturnValue({
+      accessToken: "tokB",
+      refreshToken: "",
+      expiresAt: Date.now() + 3_600_000,
+    })
+    vi.mocked(readClaudeAccountKeyCacheEntry).mockImplementation((key) => (
+      key.startsWith("token:") ? { timestamp: Date.now(), result: cachedResult } : null
+    ))
+    vi.mocked(fetchOAuthProfile).mockResolvedValue(null)
+    vi.mocked(fetchOAuthUsage).mockResolvedValue({ status: "rate_limited" })
+
+    let captured: ClaudeAccount[] = []
+    const loop = createClaudeRefreshLoop((a) => { captured = a }, 30)
+    loop.start()
+    await vi.waitFor(() => expect(captured[0]?.data?.fiveHour?.utilization).toBe(64))
+    loop.stop()
+
+    expect(captured[0]?.label).toBe("Claude (_auth.json, Bob)")
+    expect(fetchOAuthUsage).not.toHaveBeenCalled()
+  })
+
   it("does not re-query a successful account inside the minimum fetch interval", async () => {
     vi.mocked(listOpenCodeAuthFiles).mockReturnValue(["/d/auth.json"])
     vi.mocked(fetchOAuthUsage).mockResolvedValue({ status: "ok", usage: USAGE })
