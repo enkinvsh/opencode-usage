@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto"
+import { basename, dirname, join } from "node:path"
 import { readKeychainCredentials, readCredentialsFile, readOpenCodeAuth, readOpenCodeAuthFrom, listOpenCodeAuthFiles, refreshToken, isTokenExpired } from "./keychain"
 import { fetchOAuthUsage, fetchOAuthProfile } from "./oauth-client"
 import { extractSessionKey, fetchWebUsage } from "./cookie-reader"
@@ -244,6 +245,21 @@ function tokenCacheKey(accessToken: string): string {
   return `token:${createHash("sha256").update(accessToken).digest("hex")}`
 }
 
+function siblingAuthFile(filePath: string): string | null {
+  const base = basename(filePath)
+  if (base === "auth.json") return join(dirname(filePath), "_auth.json")
+  if (base === "_auth.json") return join(dirname(filePath), "auth.json")
+  return null
+}
+
+function accountCacheKeys(filePath: string, accessToken: string): readonly string[] {
+  const currentStateKey = accountStateKey(filePath, accessToken)
+  const sibling = siblingAuthFile(filePath)
+  const keys = [tokenCacheKey(accessToken), accountCacheKey(currentStateKey)]
+  if (sibling) keys.push(accountCacheKey(accountStateKey(sibling, accessToken)))
+  return keys
+}
+
 function readAccountKeyCache(accountKeys: readonly string[]) {
   for (const key of accountKeys) {
     const cached = readClaudeAccountKeyCacheEntry<FetchResult>(key)
@@ -318,7 +334,7 @@ export function createClaudeRefreshLoop(
     if (!auth) return toAccount(file, file, { usage: null, profile: null, authMethod: "none", identity: null, usageStatus: "unavailable" })
 
     const stateKey = accountStateKey(file, auth.accessToken)
-    const cacheKeys = [tokenCacheKey(auth.accessToken), accountCacheKey(stateKey)]
+    const cacheKeys = accountCacheKeys(file, auth.accessToken)
     const cached = readAccountKeyCache(cacheKeys)
     const cachedSlot = hydrateSlotFromCache(stateKey, cached)
     const now = Date.now()
