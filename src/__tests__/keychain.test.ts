@@ -1,6 +1,9 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest"
 import { execFile } from "node:child_process"
-import { readKeychainCredentials } from "../keychain.js"
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, statSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+import { readKeychainCredentials, writeOpenCodeAuthTo, isPrimaryAuthFile } from "../keychain.js"
 
 vi.mock("node:child_process", () => ({
   execFile: vi.fn(),
@@ -72,5 +75,59 @@ describe("readKeychainCredentials", () => {
 
     expect(result).toBeNull()
     expect(mockExecFile).not.toHaveBeenCalled()
+  })
+})
+
+describe("isPrimaryAuthFile", () => {
+  it("treats auth.json as the primary opencode-managed file", () => {
+    expect(isPrimaryAuthFile("/d/auth.json")).toBe(true)
+  })
+
+  it("treats _auth.json as a non-primary (secondary) file", () => {
+    expect(isPrimaryAuthFile("/d/_auth.json")).toBe(false)
+  })
+})
+
+describe("writeOpenCodeAuthTo", () => {
+  let dir: string
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "auth-write-"))
+  })
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  it("persists rotated anthropic tokens while preserving the openai block (S5)", () => {
+    const file = join(dir, "_auth.json")
+    const seed = {
+      anthropic: { type: "oauth", access: "old", refresh: "oldR", expires: 1 },
+      openai: { type: "oauth", refresh: "r", access: "a", expires: 2, accountId: "acc" },
+    }
+    writeFileSync(file, JSON.stringify(seed), "utf8")
+
+    writeOpenCodeAuthTo(file, { accessToken: "newA", refreshToken: "newR", expiresAt: 9999 })
+
+    const onDisk = JSON.parse(readFileSync(file, "utf8"))
+    expect(onDisk.anthropic.access).toBe("newA")
+    expect(onDisk.anthropic.refresh).toBe("newR")
+    expect(onDisk.anthropic.expires).toBe(9999)
+    expect(onDisk.anthropic.type).toBe("oauth")
+    expect(onDisk.openai).toEqual(seed.openai)
+  })
+
+  it("writes the file with 0600 permissions", () => {
+    const file = join(dir, "_auth.json")
+    writeFileSync(file, JSON.stringify({ anthropic: { type: "oauth", access: "old", refresh: "oldR", expires: 1 } }), "utf8")
+
+    writeOpenCodeAuthTo(file, { accessToken: "newA", refreshToken: "newR", expiresAt: 9999 })
+
+    expect(statSync(file).mode & 0o777).toBe(0o600)
+  })
+
+  it("does not throw when the target file is missing", () => {
+    const file = join(dir, "does-not-exist.json")
+    expect(() => writeOpenCodeAuthTo(file, { accessToken: "a", refreshToken: "b", expiresAt: 3 })).not.toThrow()
   })
 })

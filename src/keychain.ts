@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process"
-import { readFileSync, existsSync } from "node:fs"
+import { readFileSync, writeFileSync, renameSync, chmodSync, existsSync } from "node:fs"
 import { homedir } from "node:os"
-import { join } from "node:path"
+import { join, basename, dirname } from "node:path"
 import type { OAuthCredentials } from "./types"
 
 const KEYCHAIN_SERVICE = "Claude Code-credentials"
@@ -81,6 +81,29 @@ export function listOpenCodeAuthFiles(): string[] {
   if (existsSync(OPENCODE_AUTH_FILE)) files.push(OPENCODE_AUTH_FILE)
   if (existsSync(OPENCODE_SECONDARY_AUTH_FILE)) files.push(OPENCODE_SECONDARY_AUTH_FILE)
   return files
+}
+
+export function isPrimaryAuthFile(filePath: string): boolean {
+  return basename(filePath) === "auth.json"
+}
+
+export function writeOpenCodeAuthTo(filePath: string, tokens: OpenCodeAuth): void {
+  try {
+    const raw = readFileSync(filePath, "utf8")
+    const data = JSON.parse(raw) as Record<string, unknown>
+    const prev = (data.anthropic ?? {}) as Record<string, unknown>
+    data.anthropic = {
+      ...prev,
+      type: "oauth",
+      access: tokens.accessToken,
+      refresh: tokens.refreshToken,
+      expires: tokens.expiresAt,
+    }
+    const tmp = join(dirname(filePath), `.${basename(filePath)}.${process.pid}.tmp`)
+    writeFileSync(tmp, JSON.stringify(data), { encoding: "utf8", mode: 0o600 })
+    renameSync(tmp, filePath)
+    chmodSync(filePath, 0o600)
+  } catch {}
 }
 
 export async function refreshToken(refreshTokenStr: string): Promise<OAuthCredentials | null> {
