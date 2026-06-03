@@ -8,6 +8,8 @@ vi.mock("../keychain.js", () => ({
   listOpenCodeAuthFiles: vi.fn(),
   refreshToken: vi.fn(),
   isTokenExpired: vi.fn(),
+  writeOpenCodeAuthTo: vi.fn(),
+  isPrimaryAuthFile: vi.fn((p: string) => p.endsWith("/auth.json")),
 }))
 vi.mock("../oauth-client.js", () => ({
   fetchOAuthUsage: vi.fn(),
@@ -29,7 +31,7 @@ vi.mock("../cache.js", () => ({
   writeClaudeAccountKeyCache: vi.fn(),
 }))
 
-import { readKeychainCredentials, readCredentialsFile, readOpenCodeAuth, readOpenCodeAuthFrom, listOpenCodeAuthFiles, refreshToken, isTokenExpired } from "../keychain.js"
+import { readKeychainCredentials, readCredentialsFile, readOpenCodeAuth, readOpenCodeAuthFrom, listOpenCodeAuthFiles, refreshToken, isTokenExpired, writeOpenCodeAuthTo } from "../keychain.js"
 import { fetchOAuthUsage, fetchOAuthProfile } from "../oauth-client.js"
 import { extractSessionKey, fetchWebUsage } from "../cookie-reader.js"
 import { detectClaude, probeCLIUsage, probeStatus } from "../cli-probe.js"
@@ -142,41 +144,30 @@ describe("fetchUsageData fallback chain", () => {
     expect(fetchOAuthUsage).not.toHaveBeenCalledWith("file-token")
   })
 
-  it("refreshes OpenCode auth.json token again after the cached refreshed token expires", async () => {
+  it("never refreshes or queries usage for an expired primary auth.json (fallback path)", async () => {
     vi.mocked(readOpenCodeAuth).mockReturnValue({
-      accessToken: "expired-source-token",
+      accessToken: "expired-primary",
       refreshToken: "opencode-refresh",
       expiresAt: 1,
     })
     vi.mocked(isTokenExpired).mockReturnValue(true)
-    vi.mocked(refreshToken)
-      .mockResolvedValueOnce({
-        accessToken: "fresh-token-1",
-        refreshToken: "opencode-refresh",
-        expiresAt: 2,
-        scopes: [],
-        subscriptionType: null,
-        rateLimitTier: null,
-        hasProfileScope: false,
-      })
-      .mockResolvedValueOnce({
-        accessToken: "fresh-token-2",
-        refreshToken: "opencode-refresh",
-        expiresAt: 3,
-        scopes: [],
-        subscriptionType: null,
-        rateLimitTier: null,
-        hasProfileScope: false,
-      })
-    vi.mocked(fetchOAuthProfile).mockResolvedValue({ email: "primary@example.com", name: "Primary", plan: null })
+    vi.mocked(refreshToken).mockResolvedValue({
+      accessToken: "fresh-token",
+      refreshToken: "opencode-refresh",
+      expiresAt: Date.now() + 3_600_000,
+      scopes: [],
+      subscriptionType: null,
+      rateLimitTier: null,
+      hasProfileScope: false,
+    })
     vi.mocked(fetchOAuthUsage).mockResolvedValue({ status: "ok", usage: USAGE })
 
-    await fetchUsageData()
-    await fetchUsageData()
+    const result = await fetchUsageData()
 
-    expect(refreshToken).toHaveBeenCalledTimes(2)
-    expect(fetchOAuthUsage).toHaveBeenNthCalledWith(1, "fresh-token-1")
-    expect(fetchOAuthUsage).toHaveBeenNthCalledWith(2, "fresh-token-2")
+    expect(refreshToken).not.toHaveBeenCalled()
+    expect(fetchOAuthUsage).not.toHaveBeenCalled()
+    expect(result.usage).toBeNull()
+    expect(result.usageStatus).toBe("unavailable")
   })
 
   it("does not fall through to a different account when OpenCode usage is rate limited", async () => {
@@ -423,5 +414,140 @@ describe("createClaudeRefreshLoop multi-account", () => {
     loop.stop()
 
     expect(captured[0]?.data).toBeNull()
+  })
+
+  it("persists the rotated token and renders usage for an expired secondary _auth.json (S1)", async () => {
+    const future = Date.now() + 3_600_000
+    vi.mocked(listOpenCodeAuthFiles).mockReturnValue(["/d/_auth.json"])
+    vi.mocked(readOpenCodeAuthFrom).mockReturnValue({ accessToken: "expiredB", refreshToken: "R", expiresAt: 1 })
+    vi.mocked(isTokenExpired).mockReturnValue(true)
+    vi.mocked(refreshToken).mockResolvedValue({
+      accessToken: "freshB",
+      refreshToken: "rotR",
+      expiresAt: future,
+      scopes: [],
+      subscriptionType: null,
+      rateLimitTier: null,
+      hasProfileScope: false,
+    })
+    vi.mocked(fetchOAuthProfile).mockResolvedValue({ email: "b@x.com", name: "Bob", plan: null })
+    vi.mocked(fetchOAuthUsage).mockResolvedValue({ status: "ok", usage: USAGE })
+
+    let captured: ClaudeAccount[] = []
+    const loop = createClaudeRefreshLoop((a) => { captured = a }, 60_000)
+    loop.start()
+    await vi.waitFor(() => expect(captured[0]?.data?.fiveHour?.utilization).toBe(10))
+    loop.stop()
+
+    expect(writeOpenCodeAuthTo).toHaveBeenCalledWith("/d/_auth.json", { accessToken: "freshB", refreshToken: "rotR", expiresAt: future })
+    expect(fetchOAuthUsage).toHaveBeenCalledWith("freshB")
+    expect(fetchOAuthUsage).not.toHaveBeenCalledWith("expiredB")
+  })
+
+  it("shows not-configured without sending the expired token when secondary refresh fails (S2)", async () => {
+    vi.mocked(listOpenCodeAuthFiles).mockReturnValue(["/d/_auth.json"])
+    vi.mocked(readOpenCodeAuthFrom).mockReturnValue({ accessToken: "expiredB", refreshToken: "R", expiresAt: 1 })
+    vi.mocked(isTokenExpired).mockReturnValue(true)
+    vi.mocked(refreshToken).mockResolvedValue(null)
+    vi.mocked(fetchOAuthUsage).mockResolvedValue({ status: "ok", usage: USAGE })
+
+    let captured: ClaudeAccount[] = []
+    const loop = createClaudeRefreshLoop((a) => { captured = a }, 60_000)
+    loop.start()
+    await vi.waitFor(() => expect(captured[0]?.status).toBe("not-configured"))
+    loop.stop()
+
+    expect(fetchOAuthUsage).not.toHaveBeenCalled()
+    expect(writeOpenCodeAuthTo).not.toHaveBeenCalled()
+  })
+
+  it("never refreshes, persists, or queries the expired primary auth.json (S3)", async () => {
+    vi.mocked(listOpenCodeAuthFiles).mockReturnValue(["/d/auth.json"])
+    vi.mocked(readOpenCodeAuthFrom).mockReturnValue({ accessToken: "expiredA", refreshToken: "R", expiresAt: 1 })
+    vi.mocked(isTokenExpired).mockReturnValue(true)
+    vi.mocked(fetchOAuthUsage).mockResolvedValue({ status: "ok", usage: USAGE })
+
+    let captured: ClaudeAccount[] = []
+    const loop = createClaudeRefreshLoop((a) => { captured = a }, 60_000)
+    loop.start()
+    await vi.waitFor(() => expect(captured).toHaveLength(1))
+    loop.stop()
+
+    expect(refreshToken).not.toHaveBeenCalled()
+    expect(writeOpenCodeAuthTo).not.toHaveBeenCalled()
+    expect(fetchOAuthUsage).not.toHaveBeenCalled()
+  })
+
+  it("honors Retry-After under the rotated token key after a secondary rotation (S6)", async () => {
+    let diskAuth = { accessToken: "rotExpired", refreshToken: "R", expiresAt: 1 }
+    vi.mocked(listOpenCodeAuthFiles).mockReturnValue(["/rot/_auth.json"])
+    vi.mocked(readOpenCodeAuthFrom).mockImplementation(() => ({ ...diskAuth }))
+    vi.mocked(writeOpenCodeAuthTo).mockImplementation((_file, tokens) => {
+      diskAuth = { accessToken: tokens.accessToken, refreshToken: tokens.refreshToken, expiresAt: tokens.expiresAt }
+    })
+    vi.mocked(isTokenExpired).mockImplementation((exp) => exp <= 1)
+    vi.mocked(refreshToken).mockResolvedValue({
+      accessToken: "rotFresh",
+      refreshToken: "rotR",
+      expiresAt: Date.now() + 3_600_000,
+      scopes: [],
+      subscriptionType: null,
+      rateLimitTier: null,
+      hasProfileScope: false,
+    })
+    vi.mocked(fetchOAuthProfile).mockResolvedValue({ email: "b@x.com", name: "Bob", plan: null })
+    vi.mocked(fetchOAuthUsage).mockResolvedValue({ status: "rate_limited", retryAfterMs: 999_999 })
+
+    const loop = createClaudeRefreshLoop(() => {}, 20)
+    loop.start()
+    await new Promise((r) => setTimeout(r, 160))
+    loop.stop()
+
+    expect(refreshToken).toHaveBeenCalledTimes(1)
+    expect(fetchOAuthUsage).toHaveBeenCalledTimes(1)
+  })
+
+  it("honors Retry-After when the same account moves between auth.json and _auth.json (S7)", async () => {
+    let files = ["/d/auth.json"]
+    vi.mocked(listOpenCodeAuthFiles).mockImplementation(() => files)
+    vi.mocked(readOpenCodeAuthFrom).mockReturnValue({ accessToken: "MOVE", refreshToken: "", expiresAt: Date.now() + 3_600_000 })
+    vi.mocked(isTokenExpired).mockReturnValue(false)
+    vi.mocked(fetchOAuthProfile).mockResolvedValue({ email: "m@x.com", name: "Mover", plan: null })
+    vi.mocked(fetchOAuthUsage).mockResolvedValue({ status: "rate_limited", retryAfterMs: 999_999 })
+
+    const loop = createClaudeRefreshLoop(() => {}, 20)
+    loop.start()
+    await vi.waitFor(() => expect(vi.mocked(fetchOAuthUsage)).toHaveBeenCalledTimes(1))
+    files = ["/d/_auth.json"]
+    await new Promise((r) => setTimeout(r, 120))
+    loop.stop()
+
+    expect(fetchOAuthUsage).toHaveBeenCalledTimes(1)
+  })
+
+  it("honors Retry-After after rotation even if the disk persist fails (S8)", async () => {
+    vi.mocked(listOpenCodeAuthFiles).mockReturnValue(["/pf/_auth.json"])
+    vi.mocked(readOpenCodeAuthFrom).mockReturnValue({ accessToken: "pfExpired", refreshToken: "R", expiresAt: 1 })
+    vi.mocked(isTokenExpired).mockImplementation((exp) => exp <= 1)
+    vi.mocked(writeOpenCodeAuthTo).mockImplementation(() => { throw new Error("disk full") })
+    vi.mocked(refreshToken).mockResolvedValue({
+      accessToken: "pfFresh",
+      refreshToken: "rotR",
+      expiresAt: Date.now() + 3_600_000,
+      scopes: [],
+      subscriptionType: null,
+      rateLimitTier: null,
+      hasProfileScope: false,
+    })
+    vi.mocked(fetchOAuthProfile).mockResolvedValue({ email: "p@x.com", name: "PF", plan: null })
+    vi.mocked(fetchOAuthUsage).mockResolvedValue({ status: "rate_limited", retryAfterMs: 999_999 })
+
+    const loop = createClaudeRefreshLoop(() => {}, 20)
+    loop.start()
+    await new Promise((r) => setTimeout(r, 160))
+    loop.stop()
+
+    expect(refreshToken).toHaveBeenCalledTimes(1)
+    expect(fetchOAuthUsage).toHaveBeenCalledTimes(1)
   })
 })
