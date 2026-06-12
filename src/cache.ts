@@ -29,6 +29,8 @@ interface CacheFile {
   cooldowns?: Record<string, number>
 }
 
+const LEGACY_KEYS = ["claudeAccounts", "claudeAccountKeys", "claudeActiveIdentity"] as const
+
 function validEntry<T>(entry: NamespaceEntry<T> | undefined): NamespaceEntry<T> | null {
   if (!entry) return null
   if (typeof entry.timestamp !== "number") return null
@@ -58,7 +60,9 @@ function writeCacheFile(data: CacheFile): void {
 }
 
 function mutateCacheFile(mutator: (file: CacheFile) => CacheFile): void {
-  writeCacheFile(mutator(readCacheFile()))
+  const updated = mutator(readCacheFile()) as CacheFile & Record<string, unknown>
+  for (const key of LEGACY_KEYS) delete updated[key]
+  writeCacheFile(updated)
 }
 
 // ── Namespaced cache (codex + legacy single-account claude) ─────────────────
