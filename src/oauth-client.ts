@@ -61,8 +61,11 @@ export async function fetchOAuthUsage(accessToken: string): Promise<UsageFetchRe
   )
   if (!response) return { status: "unavailable" }
   if (response.status === 429) {
-    const retryAfterSec = Number(response.headers.get("retry-after"))
-    return Number.isFinite(retryAfterSec) && retryAfterSec > 0
+    // `retry-after: 0` is meaningful (the server allows an immediate retry), so it is
+    // preserved as retryAfterMs 0 — distinct from a missing header (no retryAfterMs).
+    const retryAfterHeader = response.headers.get("retry-after")
+    const retryAfterSec = retryAfterHeader === null ? Number.NaN : Number(retryAfterHeader)
+    return Number.isFinite(retryAfterSec) && retryAfterSec >= 0
       ? { status: "rate_limited", retryAfterMs: retryAfterSec * 1000 }
       : { status: "rate_limited" }
   }

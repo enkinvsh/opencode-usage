@@ -33,9 +33,19 @@ describe("fetchOAuthUsage", () => {
     expect(await fetchOAuthUsage("scope-missing-token")).toEqual({ status: "auth_failed" })
   })
 
-  it("returns rate_limited on 429 response", async () => {
+  it("returns rate_limited without retryAfterMs when 429 has no retry-after header", async () => {
     vi.mocked(fetch).mockResolvedValue(new Response(null, { status: 429 }))
     expect(await fetchOAuthUsage("rate-limited-token")).toEqual({ status: "rate_limited" })
+  })
+
+  it("preserves retry-after: 0 as retryAfterMs 0 (immediate-retry hint)", async () => {
+    vi.mocked(fetch).mockResolvedValue(new Response(null, { status: 429, headers: { "retry-after": "0" } }))
+    expect(await fetchOAuthUsage("rate-limited-token")).toEqual({ status: "rate_limited", retryAfterMs: 0 })
+  })
+
+  it("converts a positive retry-after to milliseconds", async () => {
+    vi.mocked(fetch).mockResolvedValue(new Response(null, { status: 429, headers: { "retry-after": "30" } }))
+    expect(await fetchOAuthUsage("rate-limited-token")).toEqual({ status: "rate_limited", retryAfterMs: 30_000 })
   })
 
   it("parses valid usage response with snake_case conversion", async () => {

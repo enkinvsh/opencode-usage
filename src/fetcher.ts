@@ -39,6 +39,24 @@ function tickMsFor(intervalMs: number): number {
 }
 
 const RATE_LIMIT_FALLBACK_COOLDOWN_MS = 120_000
+
+// When several pollers contend for the same account (e.g. multiple TUI windows,
+// possibly running older plugin versions), the usage endpoint answers 429 with
+// `retry-after: 0` — an explicit immediate-retry permission. A few short retries
+// reliably break through, whereas a single polite long backoff loses the race to
+// the other pollers forever and the display goes permanently stale.
+const RATE_LIMIT_INLINE_RETRIES = 6
+const RATE_LIMIT_RETRY_HINT_MAX_MS = 2_000
+const RATE_LIMIT_RETRY_SOON_COOLDOWN_MS = 20_000
+
+function rateLimitRetryDelayMs(): number {
+  const fromEnv = Number(process.env.OPENCODE_USAGE_RETRY_DELAY_MS)
+  return Number.isFinite(fromEnv) && fromEnv > 0 ? fromEnv : 2_000
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
 const REFRESH_LOCK_STALE_MS = 5 * 60 * 1000
 const REFRESH_BLOCK_MS = 8 * 60 * 60 * 1000
 
@@ -74,7 +92,7 @@ interface OAuthAttempt {
   retryAfterMs?: number
 }
 
-async function attemptOAuth(token: string): Promise<OAuthAttempt> {
+async function attemptOAuthOnce(token: string): Promise<OAuthAttempt> {
   try {
     const [usageResult, profile] = await Promise.all([
       fetchOAuthUsage(token),
@@ -89,6 +107,19 @@ async function attemptOAuth(token: string): Promise<OAuthAttempt> {
   } catch {
     return { usage: null, usageStatus: "unavailable", profile: null }
   }
+}
+
+async function attemptOAuth(token: string): Promise<OAuthAttempt> {
+  let attempt = await attemptOAuthOnce(token)
+  for (let retry = 0; retry < RATE_LIMIT_INLINE_RETRIES; retry++) {
+    if (attempt.usageStatus !== "rate_limited") break
+    if (attempt.retryAfterMs === undefined || attempt.retryAfterMs > RATE_LIMIT_RETRY_HINT_MAX_MS) break
+    const base = Math.max(attempt.retryAfterMs, rateLimitRetryDelayMs())
+    await sleep(base + Math.floor(Math.random() * base * 0.35))
+    const next = await attemptOAuthOnce(token)
+    attempt = { ...next, profile: next.profile ?? attempt.profile }
+  }
+  return attempt
 }
 
 function identityOf(profile: ProfileResponse | null): string | null {
@@ -149,7 +180,7 @@ export async function fetchUsageData(): Promise<FetchResult> {
     if (attempt.usageStatus === "ok" && attempt.usage) {
       return { usage: attempt.usage, profile: attempt.profile, authMethod: "oauth", identity, usageStatus: "ok" }
     }
-    return { usage: null, profile: attempt.profile, authMethod: "oauth", identity, usageStatus: attempt.usageStatus }
+    return { usage: null, profile: attempt.profile, authMethod: "oauth", identity, usageStatus: attempt.usageStatus, retryAfterMs: attempt.retryAfterMs }
   }
 
   // ── Step 1: Environment variable token (works on all OS)
@@ -450,7 +481,12 @@ export function createClaudeRefreshLoop(
         }
         if (result.usageStatus === "rate_limited") {
           const effHash = tokenHashOf(result.effectiveAccessToken ?? preToken)
-          writeCooldown(`claude:${effHash}`, now + (result.retryAfterMs ?? Math.max(intervalMs, RATE_LIMIT_FALLBACK_COOLDOWN_MS)))
+          const cooldownMs = result.retryAfterMs !== undefined && result.retryAfterMs > 0
+            ? result.retryAfterMs
+            : result.retryAfterMs === 0
+              ? RATE_LIMIT_RETRY_SOON_COOLDOWN_MS
+              : Math.max(intervalMs, RATE_LIMIT_FALLBACK_COOLDOWN_MS)
+          writeCooldown(`claude:${effHash}`, now + cooldownMs)
         }
         return failureAccount(file, base, result, tokenHash)
       } finally {

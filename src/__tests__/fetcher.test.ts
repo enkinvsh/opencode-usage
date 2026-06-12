@@ -105,11 +105,13 @@ beforeEach(async () => {
   vi.mocked(cliProbe.probeCLIUsage).mockResolvedValue(null)
   vi.mocked(cliProbe.probeStatus).mockResolvedValue(null)
   delete process.env.CLAUDE_CODE_OAUTH_TOKEN
+  process.env.OPENCODE_USAGE_RETRY_DELAY_MS = "10"
 })
 
 afterEach(() => {
   rmSync(tmpCacheDir, { recursive: true, force: true })
   delete process.env.XDG_CACHE_HOME
+  delete process.env.OPENCODE_USAGE_RETRY_DELAY_MS
 })
 
 describe("fetchUsageData fallback chain", () => {
@@ -281,6 +283,56 @@ describe("createClaudeRefreshLoop (shared disk cache + single-flight)", () => {
     const bob = captured.find((a) => a.label === "Claude (_auth.json, Bob)")
     expect(alice?.data).toBeNull()
     expect(bob?.data).not.toBeNull()
+  })
+
+  it("retries through transient 429 (retry-after: 0) and renders fresh data", async () => {
+    vi.mocked(keychain.listOpenCodeAuthFiles).mockReturnValue(["/d/auth.json"])
+    vi.mocked(oauthClient.fetchOAuthUsage)
+      .mockResolvedValueOnce({ status: "rate_limited", retryAfterMs: 0 })
+      .mockResolvedValueOnce({ status: "rate_limited", retryAfterMs: 0 })
+      .mockResolvedValue({ status: "ok", usage: usageAt(42) })
+
+    let captured: ClaudeAccount[] = []
+    const loop = fetcher.createClaudeRefreshLoop((a) => { captured = a }, 60_000)
+    loop.start()
+    await vi.waitFor(() => expect(captured[0]?.data?.fiveHour?.utilization).toBe(42))
+    loop.stop()
+
+    expect(oauthClient.fetchOAuthUsage).toHaveBeenCalledTimes(3)
+  })
+
+  it("gives up after bounded retries on persistent retry-after: 0 and applies a short cooldown", async () => {
+    const cache = await import("../cache.js")
+    vi.mocked(keychain.listOpenCodeAuthFiles).mockReturnValue(["/d/auth.json"])
+    vi.mocked(oauthClient.fetchOAuthUsage).mockResolvedValue({ status: "rate_limited", retryAfterMs: 0 })
+
+    const before = Date.now()
+    let captured: ClaudeAccount[] = []
+    const loop = fetcher.createClaudeRefreshLoop((a) => { captured = a }, 60_000)
+    loop.start()
+    await vi.waitFor(() => expect(captured).toHaveLength(1))
+    loop.stop()
+
+    expect(oauthClient.fetchOAuthUsage).toHaveBeenCalledTimes(7)
+    const cooldownUntil = cache.readCooldown(`claude:${tokenHashOf("tokA")}`)
+    expect(cooldownUntil).toBeGreaterThan(before)
+    expect(cooldownUntil).toBeLessThanOrEqual(Date.now() + 20_000)
+  })
+
+  it("does not inline-retry a 429 without a retry-after hint and applies the long cooldown", async () => {
+    const cache = await import("../cache.js")
+    vi.mocked(keychain.listOpenCodeAuthFiles).mockReturnValue(["/d/auth.json"])
+    vi.mocked(oauthClient.fetchOAuthUsage).mockResolvedValue({ status: "rate_limited" })
+
+    const before = Date.now()
+    let captured: ClaudeAccount[] = []
+    const loop = fetcher.createClaudeRefreshLoop((a) => { captured = a }, 60_000)
+    loop.start()
+    await vi.waitFor(() => expect(captured).toHaveLength(1))
+    loop.stop()
+
+    expect(oauthClient.fetchOAuthUsage).toHaveBeenCalledTimes(1)
+    expect(cache.readCooldown(`claude:${tokenHashOf("tokA")}`)).toBeGreaterThanOrEqual(before + 120_000)
   })
 
   it("honors Retry-After via the shared cooldown and does not re-query during it", async () => {
