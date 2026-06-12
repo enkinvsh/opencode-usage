@@ -6,7 +6,7 @@ import {
   decodeAccessTokenJwt,
 } from "./codex-auth"
 import { fetchCodexUsage } from "./codex-oauth-client"
-import { readNamespacedCache, writeNamespacedCache } from "./cache"
+import { readNamespacedCacheEntry, writeNamespacedCache, tryAcquireFetchLock, releaseFetchLock } from "./cache"
 import type {
   CodexState,
   CodexUsageResponse,
@@ -21,7 +21,27 @@ interface CodexFetchResult {
   authMethod: CodexAuthMethod
 }
 
+// See fetcher.ts: render tick is faster than the fetch interval so all TUI
+// processes converge on the shared disk cache quickly; only the fetch-lock
+// holder hits the network.
+const MAX_TICK_MS = 15_000
+
+function tickMsFor(intervalMs: number): number {
+  return Math.max(1, Math.min(MAX_TICK_MS, Math.floor(intervalMs / 4)))
+}
+
 const failedTokens = new Set<string>()
+
+// Refreshed Codex access tokens are reused in-memory instead of being written
+// back to ~/.codex/auth.json (that file is owned by the Codex CLI). Without
+// this, an expired auth file would trigger a token refresh on EVERY interval.
+interface RefreshedCodexToken {
+  sourceRefreshToken: string
+  accessToken: string
+  accountId: string | null
+  expiresAt: number
+}
+let refreshedCodexToken: RefreshedCodexToken | null = null
 
 function profileFromUsage(usage: CodexUsageResponse | null, accessToken: string): CodexProfile | null {
   if (usage?.email || usage?.planType) {
@@ -33,35 +53,10 @@ function profileFromUsage(usage: CodexUsageResponse | null, accessToken: string)
   return { email: jwt.email, planType: jwt.chatgptPlanType }
 }
 
-async function tryCredentials(
-  creds: CodexCredentials | null,
-  method: CodexAuthMethod,
-): Promise<CodexFetchResult | null> {
-  if (!creds || !creds.accountId) return null
-  let token = creds.accessToken
+async function attemptUsage(token: string, accountId: string, method: CodexAuthMethod): Promise<CodexFetchResult | null> {
   if (failedTokens.has(token)) return null
-
-  if (isCodexTokenExpired(creds.expiresAt) && creds.refreshToken) {
-    const refreshed = await refreshCodexToken(creds.refreshToken)
-    if (refreshed?.accessToken) {
-      token = refreshed.accessToken
-      const refreshedAccountId = refreshed.accountId ?? creds.accountId
-      if (failedTokens.has(token)) return null
-      try {
-        const usage = await fetchCodexUsage(token, refreshedAccountId)
-        if (usage) {
-          return { usage, profile: profileFromUsage(usage, token), authMethod: method }
-        }
-        failedTokens.add(token)
-      } catch {
-        failedTokens.add(token)
-      }
-      return null
-    }
-  }
-
   try {
-    const usage = await fetchCodexUsage(token, creds.accountId)
+    const usage = await fetchCodexUsage(token, accountId)
     if (usage) {
       return { usage, profile: profileFromUsage(usage, token), authMethod: method }
     }
@@ -70,6 +65,36 @@ async function tryCredentials(
     failedTokens.add(token)
   }
   return null
+}
+
+async function tryCredentials(
+  creds: CodexCredentials | null,
+  method: CodexAuthMethod,
+): Promise<CodexFetchResult | null> {
+  if (!creds || !creds.accountId) return null
+
+  if (isCodexTokenExpired(creds.expiresAt)) {
+    // Reuse a token we already refreshed for this refresh-token lineage.
+    if (
+      refreshedCodexToken &&
+      refreshedCodexToken.sourceRefreshToken === creds.refreshToken &&
+      !isCodexTokenExpired(refreshedCodexToken.expiresAt)
+    ) {
+      return attemptUsage(refreshedCodexToken.accessToken, refreshedCodexToken.accountId ?? creds.accountId, method)
+    }
+    if (!creds.refreshToken) return null
+    const refreshed = await refreshCodexToken(creds.refreshToken)
+    if (!refreshed?.accessToken) return null
+    refreshedCodexToken = {
+      sourceRefreshToken: creds.refreshToken,
+      accessToken: refreshed.accessToken,
+      accountId: refreshed.accountId ?? creds.accountId,
+      expiresAt: refreshed.expiresAt,
+    }
+    return attemptUsage(refreshed.accessToken, refreshed.accountId ?? creds.accountId, method)
+  }
+
+  return attemptUsage(creds.accessToken, creds.accountId, method)
 }
 
 export async function fetchCodexUsageData(): Promise<CodexFetchResult> {
@@ -100,102 +125,77 @@ export async function fetchCodexUsageData(): Promise<CodexFetchResult> {
   return { usage: null, profile: null, authMethod: "none" }
 }
 
-function readCodexCache(): CodexFetchResult | null {
-  const cached = readNamespacedCache<CodexFetchResult>("codex")
-  if (!cached?.usage) return null
-  return cached
-}
-
-function writeCodexCache(result: CodexFetchResult): void {
-  writeNamespacedCache("codex", result)
-}
-
 export function createCodexRefreshLoop(
   setState: (state: CodexState) => void,
   intervalMs: number,
 ): { start: () => void; stop: () => void } {
   let timer: ReturnType<typeof setInterval> | null = null
   let refreshing = false
-  let lastData: CodexState["data"] = null
-  let lastProfile: CodexState["profile"] = null
-  let lastAuthMethod: CodexState["authMethod"] = "none"
-  let isFirstRun = true
+  let announcedLoading = false
+
+  function successState(result: CodexFetchResult): CodexState {
+    return {
+      status: "success",
+      data: result.usage,
+      profile: result.profile,
+      authMethod: result.authMethod,
+      error: null,
+    }
+  }
 
   async function refresh(): Promise<void> {
     if (refreshing) return
     refreshing = true
-
-    if (isFirstRun) {
-      const cached = readCodexCache()
-      if (cached?.usage) {
-        lastData = cached.usage
-        lastProfile = cached.profile
-        lastAuthMethod = cached.authMethod
-        setState({
-          status: "success",
-          data: cached.usage,
-          profile: cached.profile,
-          authMethod: cached.authMethod,
-          error: null,
-        })
-      }
-    }
-
-    if (!lastData) {
-      setState({
-        status: "loading",
-        data: null,
-        profile: null,
-        authMethod: "none",
-        error: null,
-      })
-    }
-
     try {
-      const result = await fetchCodexUsageData()
+      const entry = readNamespacedCacheEntry<CodexFetchResult>("codex")
+      const cached = entry?.result.usage ? entry.result : null
+      const fresh = entry !== null && cached !== null && Date.now() - entry.timestamp < intervalMs
 
-      if (result.authMethod === "none") {
-        if (lastData) {
-          setState({
-            status: "success",
-            data: lastData,
-            profile: lastProfile,
-            authMethod: lastAuthMethod,
-            error: null,
-          })
-        } else {
-          setState({
-            status: "not-configured",
-            data: null,
-            profile: null,
-            authMethod: "none",
-            error: null,
-          })
+      if (fresh) {
+        setState(successState(cached))
+        return
+      }
+
+      if (!tryAcquireFetchLock("codex")) {
+        // Another process is fetching; render the latest shared data meanwhile.
+        if (cached) {
+          setState(successState(cached))
+        } else if (!announcedLoading) {
+          announcedLoading = true
+          setState({ status: "loading", data: null, profile: null, authMethod: "none", error: null })
         }
-      } else {
-        lastData = result.usage
-        lastProfile = result.profile
-        lastAuthMethod = result.authMethod
-        writeCodexCache(result)
-        setState({
-          status: "success",
-          data: result.usage,
-          profile: result.profile,
-          authMethod: result.authMethod,
-          error: null,
-        })
+        return
+      }
+
+      try {
+        if (!cached && !announcedLoading) {
+          announcedLoading = true
+          setState({ status: "loading", data: null, profile: null, authMethod: "none", error: null })
+        }
+        const result = await fetchCodexUsageData()
+        if (result.authMethod !== "none" && result.usage) {
+          writeNamespacedCache("codex", result)
+          setState(successState(result))
+        } else if (cached) {
+          setState(successState(cached))
+        } else if (result.authMethod === "none") {
+          setState({ status: "not-configured", data: null, profile: null, authMethod: "none", error: null })
+        } else {
+          setState({ status: "error", data: null, profile: null, authMethod: result.authMethod, error: "fetch failed" })
+        }
+      } finally {
+        releaseFetchLock("codex")
       }
     } catch (err) {
-      setState({
-        status: lastData ? "success" : "error",
-        data: lastData,
-        profile: lastProfile,
-        authMethod: lastAuthMethod,
-        error: lastData ? null : String(err),
-      })
+      const entry = readNamespacedCacheEntry<CodexFetchResult>("codex")
+      const cached = entry?.result.usage ? entry.result : null
+      if (cached) {
+        setState(successState(cached))
+      } else {
+        setState({ status: "error", data: null, profile: null, authMethod: "none", error: String(err) })
+      }
     } finally {
       refreshing = false
-      isFirstRun = false
     }
   }
 
@@ -203,7 +203,7 @@ export function createCodexRefreshLoop(
     start() {
       if (timer !== null) return
       void refresh()
-      timer = setInterval(() => { void refresh() }, intervalMs)
+      timer = setInterval(() => { void refresh() }, tickMsFor(intervalMs))
     },
     stop() {
       if (timer !== null) {

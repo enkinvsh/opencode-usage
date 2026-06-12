@@ -1,10 +1,11 @@
 import { createHash } from "node:crypto"
-import { basename, dirname, join } from "node:path"
+import { basename } from "node:path"
 import { readKeychainCredentials, readCredentialsFile, readOpenCodeAuth, readOpenCodeAuthFrom, listOpenCodeAuthFiles, refreshToken, isTokenExpired, writeOpenCodeAuthTo, isPrimaryAuthFile } from "./keychain"
 import { fetchOAuthUsage, fetchOAuthProfile } from "./oauth-client"
 import { extractSessionKey, fetchWebUsage } from "./cookie-reader"
 import { detectClaude, probeCLIUsage, probeStatus } from "./cli-probe"
-import { readClaudeAccountCache, readClaudeAccountKeyCacheEntry, writeClaudeAccountCache, writeClaudeAccountKeyCache } from "./cache"
+import { readClaudeFileEntry, writeClaudeFileCache, updateClaudeFileEntry, readNamespacedCacheEntry, writeNamespacedCache, readCooldown, writeCooldown, tryAcquireFetchLock, releaseFetchLock } from "./cache"
+import type { NamespaceEntry } from "./cache"
 import type { OAuthUsageResponse, ProfileResponse, AuthMethod, UsageFetchStatus, ClaudeAccount } from "./types"
 
 interface FetchResult {
@@ -17,44 +18,47 @@ interface FetchResult {
   effectiveAccessToken?: string
 }
 
-const CLAUDE_ACCOUNT_MIN_FETCH_INTERVAL_MS = 60_000
-
-function readCache(identity: string | null): FetchResult | null {
-  const cached = readClaudeAccountCache<FetchResult>(identity)
-  if (!cached?.usage) return null
-  return cached
+/** Shape persisted to the shared disk cache (one entry per auth file). */
+export interface StoredAccountUsage {
+  usage: OAuthUsageResponse
+  profile: ProfileResponse | null
+  identity: string | null
+  authMethod: AuthMethod
+  /** Hash of the access token that produced this data; used to track accounts moving between auth files. */
+  tokenHash: string | null
 }
 
-function writeCache(result: FetchResult, accountKeys?: readonly string[]): void {
-  if (!result.usage) return
-  if (result.identity) writeClaudeAccountCache(result.identity, result)
-  for (const key of accountKeys ?? []) writeClaudeAccountKeyCache(key, result)
+// The TUI loop ticks faster than the refresh interval so that every process
+// quickly picks up data written to the shared disk cache by whichever process
+// holds the fetch lock. Network fetches still happen at most once per
+// intervalMs across ALL processes.
+const MAX_TICK_MS = 15_000
+
+function tickMsFor(intervalMs: number): number {
+  return Math.max(1, Math.min(MAX_TICK_MS, Math.floor(intervalMs / 4)))
 }
 
-/**
- * Fetch Claude usage data.
- *
- * If OpenCode auth.json exists, the account it authenticates is the anchor: the result
- * always belongs to that account and the chain never falls through to another auth source
- * (which may belong to a DIFFERENT Claude account). A transient HTTP 429 on the anchor is
- * surfaced (not swallowed) so the UI keeps the same account's data instead of flipping to
- * another account.
- *
- * With no OpenCode auth.json, the legacy single-account fallback applies:
- * 1. Environment variable token (CLAUDE_CODE_OAUTH_TOKEN)
- * 2. Credentials file (~/.claude/.credentials.json)
- * 3. Keychain (macOS only, user:profile scope required)
- * 4. CLI PTY probe (macOS/Linux, Python3 required)
- * 5. Browser cookies (Chrome/Firefox)
- *
- * Never throws. Always returns a FetchResult.
- */
+const RATE_LIMIT_FALLBACK_COOLDOWN_MS = 120_000
+const REFRESH_LOCK_STALE_MS = 5 * 60 * 1000
+const REFRESH_BLOCK_MS = 8 * 60 * 60 * 1000
+
+function tokenHashOf(token: string): string {
+  return createHash("sha256").update(token).digest("hex").slice(0, 32)
+}
+
 const failedTokens = new Set<string>()
+
 interface RefreshedTokenCache {
   sourceAccessToken: string
   accessToken: string
+  refreshToken: string
   expiresAt: number
 }
+
+// In-memory record of tokens we rotated ourselves. Normally the rotated token
+// is persisted back to the auth file; this map is the safety net when that
+// write fails, so we never burn the same refresh token twice.
+const refreshedTokens = new Map<string, RefreshedTokenCache>()
 
 function validRefreshedAccessToken(cached: RefreshedTokenCache | null | undefined, sourceAccessToken: string): string | null {
   if (!cached) return null
@@ -107,6 +111,25 @@ async function tryOAuthToken(token: string): Promise<FetchResult | null> {
   return null
 }
 
+/**
+ * Fetch Claude usage data (legacy single-account chain, used when no OpenCode
+ * auth file exists).
+ *
+ * If OpenCode auth.json exists, the account it authenticates is the anchor: the result
+ * always belongs to that account and the chain never falls through to another auth source
+ * (which may belong to a DIFFERENT Claude account). A transient HTTP 429 on the anchor is
+ * surfaced (not swallowed) so the UI keeps the same account's data instead of flipping to
+ * another account.
+ *
+ * With no OpenCode auth.json, the legacy single-account fallback applies:
+ * 1. Environment variable token (CLAUDE_CODE_OAUTH_TOKEN)
+ * 2. Credentials file (~/.claude/.credentials.json)
+ * 3. Keychain (macOS only, user:profile scope required)
+ * 4. CLI PTY probe (macOS/Linux, Python3 required)
+ * 5. Browser cookies (Chrome/Firefox)
+ *
+ * Never throws. Always returns a FetchResult.
+ */
 export async function fetchUsageData(): Promise<FetchResult> {
   failedTokens.clear()
 
@@ -218,72 +241,95 @@ export async function fetchUsageData(): Promise<FetchResult> {
   return { usage: null, profile: null, authMethod: "none", identity: null, usageStatus: "unavailable" }
 }
 
+type RotationOutcome =
+  | { status: "ok"; accessToken: string }
+  | { status: "auth_failed" }
+  | { status: "unavailable" }
+  | { status: "missing" }
 
-const refreshedTokens = new Map<string, RefreshedTokenCache>()
-
-function accountStateKey(filePath: string, accessToken: string): string {
-  const tokenHash = createHash("sha256").update(accessToken).digest("hex").slice(0, 16)
-  return `${filePath}\0${tokenHash}`
-}
-
-function accountCacheKey(stateKey: string): string {
-  return createHash("sha256").update(stateKey).digest("hex")
-}
-
-function tokenCacheKey(accessToken: string): string {
-  return `token:${createHash("sha256").update(accessToken).digest("hex")}`
-}
-
-function siblingAuthFile(filePath: string): string | null {
-  const base = basename(filePath)
-  if (base === "auth.json") return join(dirname(filePath), "_auth.json")
-  if (base === "_auth.json") return join(dirname(filePath), "auth.json")
-  return null
-}
-
-function accountCacheKeys(filePath: string, accessToken: string): readonly string[] {
-  const currentStateKey = accountStateKey(filePath, accessToken)
-  const sibling = siblingAuthFile(filePath)
-  const keys = [tokenCacheKey(accessToken), accountCacheKey(currentStateKey)]
-  if (sibling) keys.push(accountCacheKey(accountStateKey(sibling, accessToken)))
-  return keys
-}
-
-function readAccountKeyCache(accountKeys: readonly string[]) {
-  for (const key of accountKeys) {
-    const cached = readClaudeAccountKeyCacheEntry<FetchResult>(key)
-    if (cached?.result.usage) return cached
+/**
+ * Rotate an expired _auth.json token. This is the single token-burn point of the plugin,
+ * so it is wrapped in defense-in-depth layers on top of the caller's per-file fetch lock:
+ *
+ * 1. A shared "refresh-block" cooldown marks refresh tokens that were already used by a
+ *    process that then FAILED to persist the rotation — reusing such a token would
+ *    invalidate the whole token family. Blocked tokens are never refreshed again.
+ * 2. A dedicated cross-process refresh lock serializes the refresh itself.
+ * 3. The auth file is re-read under the lock, so a rotation persisted by another process
+ *    (or by the user re-authenticating) is picked up instead of burning the refresh token.
+ */
+async function rotateSecondaryToken(filePath: string, observedAccessToken: string): Promise<RotationOutcome> {
+  if (Date.now() < readCooldown(`refresh-block:${tokenHashOf(observedAccessToken)}`)) {
+    return { status: "unavailable" }
   }
-  return null
+  const lockKey = `refresh-${basename(filePath)}`
+  if (!tryAcquireFetchLock(lockKey, REFRESH_LOCK_STALE_MS)) {
+    return { status: "unavailable" }
+  }
+  try {
+    const latest = readOpenCodeAuthFrom(filePath)
+    if (!latest) return { status: "missing" }
+    if (!isTokenExpired(latest.expiresAt)) {
+      return { status: "ok", accessToken: latest.accessToken }
+    }
+    if (!latest.refreshToken) return { status: "auth_failed" }
+    const refreshed = await refreshToken(latest.refreshToken).catch(() => null)
+    if (!refreshed) return { status: "auth_failed" }
+    refreshedTokens.set(filePath, {
+      sourceAccessToken: latest.accessToken,
+      accessToken: refreshed.accessToken,
+      refreshToken: refreshed.refreshToken,
+      expiresAt: refreshed.expiresAt,
+    })
+    let persisted = false
+    try {
+      persisted = writeOpenCodeAuthTo(filePath, { accessToken: refreshed.accessToken, refreshToken: refreshed.refreshToken, expiresAt: refreshed.expiresAt })
+    } catch {
+      persisted = false
+    }
+    if (!persisted) {
+      writeCooldown(`refresh-block:${tokenHashOf(latest.accessToken)}`, Date.now() + REFRESH_BLOCK_MS)
+    }
+    return { status: "ok", accessToken: refreshed.accessToken }
+  } finally {
+    releaseFetchLock(lockKey)
+  }
 }
 
 /**
  * Fetch usage for a single OpenCode auth file (one Claude account). Each file is a distinct
  * account, so this never falls back to other auth sources. A transient 429 is surfaced
  * (usage null, usageStatus "rate_limited") so the caller keeps that account's last data.
+ *
+ * MUST be called while holding the per-file fetch lock: token rotation for _auth.json is
+ * only safe when a single process at a time can use the (single-use) refresh token. The
+ * auth file is re-read here, right before any refresh, so a rotation performed by another
+ * process in the meantime is picked up instead of burning the refresh token again.
+ *
+ * The primary auth.json is NEVER refreshed or written by this plugin — OpenCode itself
+ * owns that file and rotates its tokens.
  */
-async function fetchAccountUsage(filePath: string, auth = readOpenCodeAuthFrom(filePath)): Promise<FetchResult> {
+async function fetchAccountUsage(filePath: string): Promise<FetchResult> {
+  const auth = readOpenCodeAuthFrom(filePath)
   if (!auth) {
     return { usage: null, profile: null, authMethod: "none", identity: null, usageStatus: "unavailable" }
   }
-  const cachedRefresh = refreshedTokens.get(filePath)
-  const refreshedAccessToken = validRefreshedAccessToken(cachedRefresh, auth.accessToken)
-  let token = refreshedAccessToken ?? auth.accessToken
-  if (!refreshedAccessToken && isTokenExpired(auth.expiresAt)) {
+  let token = auth.accessToken
+  if (isTokenExpired(auth.expiresAt)) {
     if (isPrimaryAuthFile(filePath)) {
+      // OpenCode owns auth.json and will refresh it on its own; never touch it.
       return { usage: null, profile: null, authMethod: "oauth", identity: null, usageStatus: "unavailable" }
     }
-    if (!auth.refreshToken) {
-      return { usage: null, profile: null, authMethod: "oauth", identity: null, usageStatus: "auth_failed" }
+    const remembered = validRefreshedAccessToken(refreshedTokens.get(filePath), auth.accessToken)
+    if (remembered) {
+      token = remembered
+    } else {
+      const rotated = await rotateSecondaryToken(filePath, auth.accessToken)
+      if (rotated.status !== "ok") {
+        return { usage: null, profile: null, authMethod: rotated.status === "missing" ? "none" : "oauth", identity: null, usageStatus: rotated.status === "auth_failed" ? "auth_failed" : "unavailable" }
+      }
+      token = rotated.accessToken
     }
-    const refreshed = await refreshToken(auth.refreshToken).catch(() => null)
-    if (!refreshed) {
-      return { usage: null, profile: null, authMethod: "oauth", identity: null, usageStatus: "auth_failed" }
-    }
-    const persisted = { accessToken: refreshed.accessToken, refreshToken: refreshed.refreshToken, expiresAt: refreshed.expiresAt }
-    token = persisted.accessToken
-    refreshedTokens.set(filePath, { sourceAccessToken: auth.accessToken, accessToken: token, expiresAt: persisted.expiresAt })
-    try { writeOpenCodeAuthTo(filePath, persisted) } catch {}
   }
   const attempt = await attemptOAuth(token)
   const identity = identityOf(attempt.profile)
@@ -293,16 +339,13 @@ async function fetchAccountUsage(filePath: string, auth = readOpenCodeAuthFrom(f
   return { usage: null, profile: attempt.profile, authMethod: "oauth", identity, usageStatus: attempt.usageStatus, retryAfterMs: attempt.retryAfterMs, effectiveAccessToken: token }
 }
 
-interface AccountSlot {
-  data: OAuthUsageResponse
-  profile: ProfileResponse | null
-  authMethod: AuthMethod
-}
-
 /**
- * Create the Claude refresh loop. Renders one section per OpenCode auth file
- * (auth.json + _auth.json); falls back to the single-account fallback chain when none exist.
- * Per account, a transient 429 keeps the last known data instead of blanking.
+ * Create the Claude refresh loop.
+ *
+ * Architecture: the shared disk cache (~/.cache/opencode-usage/last.json) is the single
+ * source of truth. Every TUI process renders from it on a fast tick; at most ONE process
+ * (the fetch-lock holder) refreshes a given account per intervalMs. Rate-limit cooldowns
+ * are stored in the same shared file, so all processes honor the same Retry-After.
  */
 export function createClaudeRefreshLoop(
   setAccounts: (accounts: ClaudeAccount[]) => void,
@@ -310,103 +353,154 @@ export function createClaudeRefreshLoop(
 ): { start: () => void; stop: () => void } {
   let timer: ReturnType<typeof setInterval> | null = null
   let refreshing = false
-  const slots = new Map<string, AccountSlot>()
-  const lastProfiles = new Map<string, ProfileResponse>()
-  const rateLimitedUntil = new Map<string, number>()
-  const lastRequestedAt = new Map<string, number>()
 
-  function labelFor(id: string, stateKey: string, profile: ProfileResponse | null, override?: string): string {
+  function labelFor(base: string, profile: ProfileResponse | null, override?: string): string {
     if (override) return override
-    const base = id.split("/").pop() ?? "auth.json"
-    const p = profile ?? lastProfiles.get(stateKey) ?? slots.get(stateKey)?.profile ?? null
-    const who = p?.name ?? p?.email ?? null
+    const who = profile?.name ?? profile?.email ?? null
     return who ? `Claude (${base}, ${who.slice(0, 4)})` : `Claude (${base})`
   }
 
-  // Honor the server Retry-After: while an account is cooling down, do not re-query its
-  // usage endpoint (re-querying keeps the limit alive). Show its last known data instead.
-  async function fetchOne(file: string): Promise<ClaudeAccount> {
-    const auth = readOpenCodeAuthFrom(file)
-    if (!auth) return toAccount(file, file, { usage: null, profile: null, authMethod: "none", identity: null, usageStatus: "unavailable" })
+  function siblingBase(base: string): string | null {
+    if (base === "auth.json") return "_auth.json"
+    if (base === "_auth.json") return "auth.json"
+    return null
+  }
 
-    const preToken = validRefreshedAccessToken(refreshedTokens.get(file), auth.accessToken) ?? auth.accessToken
-    const stateKey = accountStateKey(file, preToken)
-    const cacheKeys = accountCacheKeys(file, preToken)
-    const cached = readAccountKeyCache(cacheKeys)
-    const cachedSlot = hydrateSlotFromCache(stateKey, cached)
-    const now = Date.now()
-    const preCooldownKey = tokenCacheKey(preToken)
-    if (now < (rateLimitedUntil.get(preCooldownKey) ?? 0)) {
-      if (cachedSlot) {
-        return accountFromSlot(file, stateKey, cachedSlot)
+  interface ResolvedEntry {
+    entry: NamespaceEntry<StoredAccountUsage>
+    /** True when the entry's token hash matches the file's current token, i.e. the data provably belongs to this account. */
+    trusted: boolean
+  }
+
+  /**
+   * Resolve the cache entry for an auth file. A token-hash match (on the file's own entry
+   * or its sibling's, covering accounts moved between auth.json and _auth.json) is trusted.
+   * The untrusted own-entry fallback covers routine token rotation by OpenCode and may only
+   * be displayed after a fetch confirms the identity is unchanged.
+   */
+  function entryFor(base: string, tokenHash: string): ResolvedEntry | null {
+    const own = readClaudeFileEntry<StoredAccountUsage>(base)
+    if (own && own.result.tokenHash === tokenHash) return { entry: own, trusted: true }
+    const sib = siblingBase(base)
+    const sibling = sib ? readClaudeFileEntry<StoredAccountUsage>(sib) : null
+    if (sibling && sibling.result.tokenHash === tokenHash) return { entry: sibling, trusted: true }
+    return own ? { entry: own, trusted: false } : null
+  }
+
+  function accountFromStored(id: string, base: string, stored: StoredAccountUsage, profile?: ProfileResponse | null): ClaudeAccount {
+    return {
+      id,
+      label: labelFor(base, profile ?? stored.profile),
+      status: "success",
+      data: stored.usage,
+      authMethod: stored.authMethod,
+      error: null,
+    }
+  }
+
+  function failureAccount(id: string, base: string, result: FetchResult, fallbackTokenHash: string): ClaudeAccount {
+    const hash = result.effectiveAccessToken ? tokenHashOf(result.effectiveAccessToken) : fallbackTokenHash
+    const resolved = entryFor(base, hash)
+    if (resolved) {
+      const { entry, trusted } = resolved
+      const sameIdentity = result.identity !== null && entry.result.identity !== null && result.identity === entry.result.identity
+      if (trusted || sameIdentity) {
+        if (!trusted) {
+          // Token rotated but the account is verified identical: re-attribute the
+          // entry to the current token so cooldown ticks (and other processes)
+          // keep rendering it as trusted data instead of "Loading...".
+          updateClaudeFileEntry(base, { timestamp: entry.timestamp, result: { ...entry.result, tokenHash: hash } })
+        }
+        return accountFromStored(id, base, entry.result, result.profile ?? entry.result.profile)
       }
-      return { id: file, label: labelFor(file, stateKey, null), status: "loading", data: null, authMethod: "none", error: null }
-    }
-
-    const lastRequest = lastRequestedAt.get(preCooldownKey) ?? cached?.timestamp ?? 0
-    if (cachedSlot && now - lastRequest < CLAUDE_ACCOUNT_MIN_FETCH_INTERVAL_MS) {
-      return accountFromSlot(file, stateKey, cachedSlot)
-    }
-
-    lastRequestedAt.set(preCooldownKey, now)
-    const result = await fetchAccountUsage(file, auth)
-    const effToken = result.effectiveAccessToken ?? preToken
-    const effStateKey = effToken === preToken ? stateKey : accountStateKey(file, effToken)
-    const effCacheKeys = effToken === preToken ? cacheKeys : accountCacheKeys(file, effToken)
-    const cooldownKey = tokenCacheKey(effToken)
-    if (cooldownKey !== preCooldownKey) lastRequestedAt.set(cooldownKey, now)
-    if (result.profile) lastProfiles.set(effStateKey, result.profile)
-    if (result.usageStatus === "rate_limited") {
-      rateLimitedUntil.set(cooldownKey, Date.now() + (result.retryAfterMs ?? Math.max(intervalMs, 120_000)))
-    } else {
-      rateLimitedUntil.delete(cooldownKey)
-    }
-    return toAccount(file, effStateKey, result, undefined, effCacheKeys)
-  }
-
-  function hydrateSlotFromCache(stateKey: string, cached: ReturnType<typeof readAccountKeyCache>): AccountSlot | null {
-    const existing = slots.get(stateKey)
-    if (existing) return existing
-    const usage = cached?.result.usage
-    if (!usage) return null
-    const slot = { data: usage, profile: cached.result.profile, authMethod: cached.result.authMethod }
-    slots.set(stateKey, slot)
-    if (cached.result.profile) lastProfiles.set(stateKey, cached.result.profile)
-    return slot
-  }
-
-  function accountFromSlot(id: string, stateKey: string, slot: AccountSlot, labelOverride?: string): ClaudeAccount {
-    return { id, label: labelFor(id, stateKey, slot.profile, labelOverride), status: "success", data: slot.data, authMethod: slot.authMethod, error: null }
-  }
-
-  function toAccount(id: string, stateKey: string, result: FetchResult, labelOverride?: string, accountKeys?: readonly string[]): ClaudeAccount {
-    if (result.usage) {
-      slots.set(stateKey, { data: result.usage, profile: result.profile, authMethod: result.authMethod })
-      writeCache(result, accountKeys)
-      return { id, label: labelFor(id, stateKey, result.profile, labelOverride), status: "success", data: result.usage, authMethod: result.authMethod, error: null }
-    }
-    if (result.authMethod === "none") {
-      slots.delete(stateKey)
-      return { id, label: labelFor(id, stateKey, null, labelOverride), status: "not-configured", data: null, authMethod: "none", error: null }
-    }
-    const slot = slots.get(stateKey)
-    if (slot) {
-      return { id, label: labelFor(id, stateKey, result.profile, labelOverride), status: "success", data: slot.data, authMethod: slot.authMethod, error: null }
-    }
-    const keyCached = accountKeys ? readAccountKeyCache(accountKeys) : null
-    const keySlot = hydrateSlotFromCache(stateKey, keyCached)
-    if (keySlot) return accountFromSlot(id, stateKey, keySlot, labelOverride)
-
-    const cached = result.identity ? readCache(result.identity) : null
-    if (cached?.usage) {
-      slots.set(stateKey, { data: cached.usage, profile: cached.profile, authMethod: cached.authMethod })
-      writeCache(cached, accountKeys)
-      return { id, label: labelFor(id, stateKey, cached.profile ?? result.profile, labelOverride), status: "success", data: cached.usage, authMethod: cached.authMethod, error: null }
     }
     if (result.usageStatus === "auth_failed") {
-      return { id, label: labelFor(id, stateKey, result.profile, labelOverride), status: "not-configured", data: null, authMethod: "none", error: null }
+      return { id, label: labelFor(base, result.profile), status: "not-configured", data: null, authMethod: "none", error: null }
     }
-    return { id, label: labelFor(id, stateKey, result.profile, labelOverride), status: "loading", data: null, authMethod: "none", error: null }
+    return { id, label: labelFor(base, result.profile), status: "loading", data: null, authMethod: "none", error: null }
+  }
+
+  async function syncOne(file: string): Promise<ClaudeAccount> {
+    const base = basename(file)
+    const auth = readOpenCodeAuthFrom(file)
+    if (!auth) {
+      return { id: file, label: labelFor(base, null), status: "not-configured", data: null, authMethod: "none", error: null }
+    }
+    const preToken = validRefreshedAccessToken(refreshedTokens.get(file), auth.accessToken) ?? auth.accessToken
+    const tokenHash = tokenHashOf(preToken)
+    const resolved = entryFor(base, tokenHash)
+    const now = Date.now()
+    const fresh = resolved !== null && resolved.trusted && now - resolved.entry.timestamp < intervalMs
+    const coolingDown = now < readCooldown(`claude:${tokenHash}`)
+
+    if (!fresh && !coolingDown && tryAcquireFetchLock(`claude-${base}`)) {
+      try {
+        const result = await fetchAccountUsage(file)
+        if (result.usageStatus === "ok" && result.usage) {
+          const effHash = tokenHashOf(result.effectiveAccessToken ?? preToken)
+          const stored: StoredAccountUsage = {
+            usage: result.usage,
+            profile: result.profile,
+            identity: result.identity,
+            authMethod: result.authMethod,
+            tokenHash: effHash,
+          }
+          writeClaudeFileCache(base, stored)
+          return accountFromStored(file, base, stored)
+        }
+        if (result.usageStatus === "rate_limited") {
+          const effHash = tokenHashOf(result.effectiveAccessToken ?? preToken)
+          writeCooldown(`claude:${effHash}`, now + (result.retryAfterMs ?? Math.max(intervalMs, RATE_LIMIT_FALLBACK_COOLDOWN_MS)))
+        }
+        return failureAccount(file, base, result, tokenHash)
+      } finally {
+        releaseFetchLock(`claude-${base}`)
+      }
+    }
+
+    // Render from the shared cache: data is fresh, the account is cooling down,
+    // or another process holds the fetch lock and will update the cache shortly.
+    // Only token-verified (trusted) entries may be shown without a fetch.
+    if (resolved?.trusted) return accountFromStored(file, base, resolved.entry.result)
+    return { id: file, label: labelFor(base, null), status: "loading", data: null, authMethod: "none", error: null }
+  }
+
+  async function syncLegacy(): Promise<ClaudeAccount> {
+    const id = "claude"
+    const entry = readNamespacedCacheEntry<StoredAccountUsage>("claude")
+    const now = Date.now()
+    const fresh = entry !== null && now - entry.timestamp < intervalMs
+
+    if (!fresh && tryAcquireFetchLock("claude-legacy")) {
+      try {
+        const result = await fetchUsageData()
+        if (result.usage) {
+          const stored: StoredAccountUsage = {
+            usage: result.usage,
+            profile: result.profile,
+            identity: result.identity,
+            authMethod: result.authMethod,
+            tokenHash: null,
+          }
+          writeNamespacedCache("claude", stored)
+          return { id, label: "Claude", status: "success", data: result.usage, authMethod: result.authMethod, error: null }
+        }
+        if (entry) {
+          return { id, label: "Claude", status: "success", data: entry.result.usage, authMethod: entry.result.authMethod, error: null }
+        }
+        if (result.authMethod === "none") {
+          return { id, label: "Claude", status: "not-configured", data: null, authMethod: "none", error: null }
+        }
+        return { id, label: "Claude", status: "loading", data: null, authMethod: "none", error: null }
+      } finally {
+        releaseFetchLock("claude-legacy")
+      }
+    }
+
+    if (entry) {
+      return { id, label: "Claude", status: "success", data: entry.result.usage, authMethod: entry.result.authMethod, error: null }
+    }
+    return { id, label: "Claude", status: "loading", data: null, authMethod: "none", error: null }
   }
 
   async function refresh(): Promise<void> {
@@ -415,10 +509,9 @@ export function createClaudeRefreshLoop(
     try {
       const files = listOpenCodeAuthFiles()
       if (files.length === 0) {
-        const result = await fetchUsageData()
-        setAccounts([toAccount("claude", "claude", result, "Claude")])
+        setAccounts([await syncLegacy()])
       } else {
-        setAccounts(await Promise.all(files.map(fetchOne)))
+        setAccounts(await Promise.all(files.map(syncOne)))
       }
     } finally {
       refreshing = false
@@ -429,7 +522,7 @@ export function createClaudeRefreshLoop(
     start() {
       if (timer !== null) return
       void refresh()
-      timer = setInterval(() => { void refresh() }, intervalMs)
+      timer = setInterval(() => { void refresh() }, tickMsFor(intervalMs))
     },
     stop() {
       if (timer !== null) {

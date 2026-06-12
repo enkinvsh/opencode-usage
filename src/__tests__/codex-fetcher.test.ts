@@ -11,8 +11,11 @@ vi.mock("../codex-oauth-client.js", () => ({
   fetchCodexUsage: vi.fn(),
 }))
 vi.mock("../cache.js", () => ({
-  readNamespacedCache: vi.fn(),
+  readNamespacedCache: vi.fn(() => null),
+  readNamespacedCacheEntry: vi.fn(() => null),
   writeNamespacedCache: vi.fn(),
+  tryAcquireFetchLock: vi.fn(() => true),
+  releaseFetchLock: vi.fn(),
 }))
 
 import {
@@ -163,6 +166,30 @@ describe("fetchCodexUsageData fallback chain", () => {
 
     const result = await fetchCodexUsageData()
     expect(result.profile).toEqual({ email: "jwt@example.com", planType: "plus" })
+  })
+
+  it("reuses an already-refreshed access token instead of refreshing again", async () => {
+    const expired = Date.now() - 1000
+    vi.mocked(readCodexAuthFile).mockReturnValue({
+      accessToken: "stale-tok",
+      refreshToken: "rt-reuse",
+      accountId: "acct-cli",
+      expiresAt: expired,
+    })
+    vi.mocked(isCodexTokenExpired).mockImplementation((ms: number) => ms <= Date.now())
+    vi.mocked(refreshCodexToken).mockResolvedValue({
+      accessToken: "reused-tok",
+      refreshToken: "rt-next",
+      accountId: "acct-cli",
+      expiresAt: Date.now() + 3600 * 1000,
+    })
+    vi.mocked(fetchCodexUsage).mockResolvedValue(sampleUsage)
+
+    await fetchCodexUsageData()
+    await fetchCodexUsageData()
+
+    expect(refreshCodexToken).toHaveBeenCalledTimes(1)
+    expect(fetchCodexUsage).toHaveBeenLastCalledWith("reused-tok", "acct-cli")
   })
 
   it("memoises failed tokens within one fetch attempt", async () => {

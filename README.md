@@ -115,7 +115,21 @@ Uses a 3-step fallback chain to fetch Codex (ChatGPT) usage data:
 
 The plugin calls `GET https://chatgpt.com/backend-api/wham/usage` with `Authorization: Bearer <access_token>` and `ChatGPT-Account-Id: <account_id>`. Expired access tokens are automatically refreshed via `https://auth.openai.com/oauth/token`.
 
-Results for both providers are cached to disk (`~/.cache/opencode-usage/last.json`, namespaced) for instant startup. Background refresh keeps data current at the same `refreshInterval`.
+### Multi-TUI synchronization
+
+Many OpenCode TUI windows can run this plugin at the same time. The shared disk cache
+(`~/.cache/opencode-usage/last.json`) is the single source of truth:
+
+- **Single-flight fetching** — per account, at most ONE process (the fetch-lock holder)
+  queries the usage API per `refreshInterval`. Everyone else renders from the shared cache.
+- **Fast convergence** — every process re-reads the cache on a fast tick (≤15s), so all
+  TUIs show identical numbers within seconds of a refresh.
+- **Shared cooldowns** — a server `Retry-After` (HTTP 429) is recorded in the shared cache,
+  so no process re-queries a rate-limited account.
+- **Token safety** — the plugin NEVER refreshes or writes the primary `auth.json`
+  (OpenCode owns it). `_auth.json` tokens are refreshed only while holding the
+  cross-process fetch lock, with the file re-read immediately beforehand, so two processes
+  can never race the same single-use refresh token.
 
 ### Cross-Platform Support
 

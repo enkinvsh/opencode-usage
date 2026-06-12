@@ -87,7 +87,7 @@ export function isPrimaryAuthFile(filePath: string): boolean {
   return basename(filePath) === "auth.json"
 }
 
-export function writeOpenCodeAuthTo(filePath: string, tokens: OpenCodeAuth): void {
+export function writeOpenCodeAuthTo(filePath: string, tokens: OpenCodeAuth): boolean {
   try {
     const raw = readFileSync(filePath, "utf8")
     const data = JSON.parse(raw) as Record<string, unknown>
@@ -103,7 +103,10 @@ export function writeOpenCodeAuthTo(filePath: string, tokens: OpenCodeAuth): voi
     writeFileSync(tmp, JSON.stringify(data), { encoding: "utf8", mode: 0o600 })
     renameSync(tmp, filePath)
     chmodSync(filePath, 0o600)
-  } catch {}
+    return true
+  } catch {
+    return false
+  }
 }
 
 export async function refreshToken(refreshTokenStr: string): Promise<OAuthCredentials | null> {
