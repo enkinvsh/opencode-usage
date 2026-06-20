@@ -129,8 +129,6 @@ export function writeCooldown(key: string, untilMs: number): void {
 //
 // Only one process per key may hit the network per refresh interval. Other
 // processes render from the shared disk cache, which the lock holder updates.
-// This is also what serializes OAuth token refreshes for _auth.json so that
-// two processes can never race the same (single-use) refresh token.
 
 function fetchLockPath(key: string): string {
   const safe = key.replace(/[^a-zA-Z0-9._-]/g, "_")

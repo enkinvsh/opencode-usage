@@ -465,39 +465,99 @@ describe("createClaudeRefreshLoop (shared disk cache + single-flight)", () => {
     expect(captured[0]?.status).toBe("success")
   })
 
-  it("persists the rotated token and renders usage for an expired secondary _auth.json (S1)", async () => {
-    const future = Date.now() + 3_600_000
+  it("renders cached usage as stale for an expired secondary _auth.json WITHOUT refreshing or writing (S1)", async () => {
+    vi.mocked(keychain.listOpenCodeAuthFiles).mockReturnValue(["/d/_auth.json"])
+    vi.mocked(keychain.readOpenCodeAuthFrom).mockReturnValue({ accessToken: "expiredB", refreshToken: "R", expiresAt: 1 })
+    vi.mocked(keychain.isTokenExpired).mockImplementation((exp) => exp <= 1)
+    // A refresh WOULD succeed if attempted — the point is that it must NOT be attempted.
+    vi.mocked(keychain.refreshToken).mockResolvedValue({
+      accessToken: "freshB",
+      refreshToken: "rotR",
+      expiresAt: Date.now() + 3_600_000,
+      scopes: [],
+      subscriptionType: null,
+      rateLimitTier: null,
+      hasProfileScope: false,
+    })
+    vi.mocked(oauthClient.fetchOAuthUsage).mockResolvedValue({ status: "ok", usage: USAGE })
+    // Last-known usage cached under this exact (now-expired) token: trusted but stale.
+    writeRawCache({
+      claudeFiles: {
+        "_auth.json": storedEntry(Date.now() - 10 * 60_000, {
+          usage: usageAt(64),
+          profile: { email: "b@x.com", name: "Bob", plan: null },
+          identity: "b@x.com",
+          authMethod: "oauth",
+          tokenHash: tokenHashOf("expiredB"),
+        }),
+      },
+    })
+
+    let captured: ClaudeAccount[] = []
+    const loop = fetcher.createClaudeRefreshLoop((a) => { captured = a }, 60_000)
+    loop.start()
+    await vi.waitFor(() => expect(captured[0]?.data?.fiveHour?.utilization).toBe(64))
+    loop.stop()
+
+    expect(captured[0]?.status).toBe("success")
+    expect(captured[0]?.stale).toBe(true)
+    expect(keychain.refreshToken).not.toHaveBeenCalled()
+    expect(keychain.writeOpenCodeAuthTo).not.toHaveBeenCalled()
+    expect(oauthClient.fetchOAuthUsage).not.toHaveBeenCalled()
+  })
+
+  it("renders untrusted own cache as stale for an expired secondary _auth.json without refreshing (S-A2)", async () => {
     vi.mocked(keychain.listOpenCodeAuthFiles).mockReturnValue(["/d/_auth.json"])
     vi.mocked(keychain.readOpenCodeAuthFrom).mockReturnValue({ accessToken: "expiredB", refreshToken: "R", expiresAt: 1 })
     vi.mocked(keychain.isTokenExpired).mockImplementation((exp) => exp <= 1)
     vi.mocked(keychain.refreshToken).mockResolvedValue({
       accessToken: "freshB",
       refreshToken: "rotR",
-      expiresAt: future,
+      expiresAt: Date.now() + 3_600_000,
       scopes: [],
       subscriptionType: null,
       rateLimitTier: null,
       hasProfileScope: false,
     })
-    vi.mocked(oauthClient.fetchOAuthProfile).mockResolvedValue({ email: "b@x.com", name: "Bob", plan: null })
     vi.mocked(oauthClient.fetchOAuthUsage).mockResolvedValue({ status: "ok", usage: USAGE })
+    // Cache written under a DIFFERENT (already rotated) token: own entry, hash mismatch ⇒ untrusted.
+    writeRawCache({
+      claudeFiles: {
+        "_auth.json": storedEntry(Date.now() - 10 * 60_000, {
+          usage: usageAt(71),
+          profile: { email: "b@x.com", name: "Bob", plan: null },
+          identity: "b@x.com",
+          authMethod: "oauth",
+          tokenHash: tokenHashOf("someOldTokenB"),
+        }),
+      },
+    })
 
     let captured: ClaudeAccount[] = []
     const loop = fetcher.createClaudeRefreshLoop((a) => { captured = a }, 60_000)
     loop.start()
-    await vi.waitFor(() => expect(captured[0]?.data?.fiveHour?.utilization).toBe(10))
+    await vi.waitFor(() => expect(captured[0]?.data?.fiveHour?.utilization).toBe(71))
     loop.stop()
 
-    expect(keychain.writeOpenCodeAuthTo).toHaveBeenCalledWith("/d/_auth.json", { accessToken: "freshB", refreshToken: "rotR", expiresAt: future })
-    expect(oauthClient.fetchOAuthUsage).toHaveBeenCalledWith("freshB")
-    expect(oauthClient.fetchOAuthUsage).not.toHaveBeenCalledWith("expiredB")
+    expect(captured[0]?.stale).toBe(true)
+    expect(keychain.refreshToken).not.toHaveBeenCalled()
+    expect(keychain.writeOpenCodeAuthTo).not.toHaveBeenCalled()
+    expect(oauthClient.fetchOAuthUsage).not.toHaveBeenCalled()
   })
 
-  it("shows not-configured without sending the expired token when secondary refresh fails (S2)", async () => {
+  it("shows not-configured for an expired secondary with no cache, never refreshing or fetching (S2)", async () => {
     vi.mocked(keychain.listOpenCodeAuthFiles).mockReturnValue(["/d/_auth.json"])
     vi.mocked(keychain.readOpenCodeAuthFrom).mockReturnValue({ accessToken: "expiredB", refreshToken: "R", expiresAt: 1 })
     vi.mocked(keychain.isTokenExpired).mockImplementation((exp) => exp <= 1)
-    vi.mocked(keychain.refreshToken).mockResolvedValue(null)
+    vi.mocked(keychain.refreshToken).mockResolvedValue({
+      accessToken: "freshB",
+      refreshToken: "rotR",
+      expiresAt: Date.now() + 3_600_000,
+      scopes: [],
+      subscriptionType: null,
+      rateLimitTier: null,
+      hasProfileScope: false,
+    })
     vi.mocked(oauthClient.fetchOAuthUsage).mockResolvedValue({ status: "ok", usage: USAGE })
 
     let captured: ClaudeAccount[] = []
@@ -506,15 +566,28 @@ describe("createClaudeRefreshLoop (shared disk cache + single-flight)", () => {
     await vi.waitFor(() => expect(captured[0]?.status).toBe("not-configured"))
     loop.stop()
 
-    expect(oauthClient.fetchOAuthUsage).not.toHaveBeenCalled()
+    expect(keychain.refreshToken).not.toHaveBeenCalled()
     expect(keychain.writeOpenCodeAuthTo).not.toHaveBeenCalled()
+    expect(oauthClient.fetchOAuthUsage).not.toHaveBeenCalled()
   })
 
-  it("never refreshes, persists, or queries the expired primary auth.json (S3)", async () => {
+  it("never refreshes/persists/queries an expired primary auth.json and hides its mismatched cache (S3)", async () => {
     vi.mocked(keychain.listOpenCodeAuthFiles).mockReturnValue(["/d/auth.json"])
     vi.mocked(keychain.readOpenCodeAuthFrom).mockReturnValue({ accessToken: "expiredA", refreshToken: "R", expiresAt: 1 })
     vi.mocked(keychain.isTokenExpired).mockImplementation((exp) => exp <= 1)
     vi.mocked(oauthClient.fetchOAuthUsage).mockResolvedValue({ status: "ok", usage: USAGE })
+    // A cache from a DIFFERENT token (account swap) must never be shown for the primary file.
+    writeRawCache({
+      claudeFiles: {
+        "auth.json": storedEntry(Date.now() - 10 * 60_000, {
+          usage: usageAt(88),
+          profile: { email: "a@x.com", name: "Alice", plan: null },
+          identity: "a@x.com",
+          authMethod: "oauth",
+          tokenHash: tokenHashOf("tokOld"),
+        }),
+      },
+    })
 
     let captured: ClaudeAccount[] = []
     const loop = fetcher.createClaudeRefreshLoop((a) => { captured = a }, 60_000)
@@ -522,16 +595,16 @@ describe("createClaudeRefreshLoop (shared disk cache + single-flight)", () => {
     await vi.waitFor(() => expect(captured).toHaveLength(1))
     loop.stop()
 
+    expect(captured[0]?.data).toBeNull()
     expect(keychain.refreshToken).not.toHaveBeenCalled()
     expect(keychain.writeOpenCodeAuthTo).not.toHaveBeenCalled()
     expect(oauthClient.fetchOAuthUsage).not.toHaveBeenCalled()
   })
 
-  it("refreshes exactly once even when persisting the rotated token fails (S8)", async () => {
+  it("never refreshes or writes an expired secondary across fast ticks, rendering cached usage (S8)", async () => {
     vi.mocked(keychain.listOpenCodeAuthFiles).mockReturnValue(["/pf/_auth.json"])
     vi.mocked(keychain.readOpenCodeAuthFrom).mockReturnValue({ accessToken: "pfExpired", refreshToken: "R", expiresAt: 1 })
     vi.mocked(keychain.isTokenExpired).mockImplementation((exp) => exp <= 1)
-    vi.mocked(keychain.writeOpenCodeAuthTo).mockImplementation(() => { throw new Error("disk full") })
     vi.mocked(keychain.refreshToken).mockResolvedValue({
       accessToken: "pfFresh",
       refreshToken: "rotR",
@@ -541,16 +614,30 @@ describe("createClaudeRefreshLoop (shared disk cache + single-flight)", () => {
       rateLimitTier: null,
       hasProfileScope: false,
     })
-    vi.mocked(oauthClient.fetchOAuthProfile).mockResolvedValue({ email: "p@x.com", name: "PF", plan: null })
-    vi.mocked(oauthClient.fetchOAuthUsage).mockResolvedValue({ status: "rate_limited", retryAfterMs: 999_999 })
+    vi.mocked(oauthClient.fetchOAuthUsage).mockResolvedValue({ status: "ok", usage: USAGE })
+    writeRawCache({
+      claudeFiles: {
+        "_auth.json": storedEntry(Date.now() - 10 * 60_000, {
+          usage: usageAt(48),
+          profile: { email: "p@x.com", name: "PF", plan: null },
+          identity: "p@x.com",
+          authMethod: "oauth",
+          tokenHash: tokenHashOf("pfExpired"),
+        }),
+      },
+    })
 
-    const loop = fetcher.createClaudeRefreshLoop(() => {}, 60)
+    let captured: ClaudeAccount[] = []
+    const loop = fetcher.createClaudeRefreshLoop((a) => { captured = a }, 60)
     loop.start()
     await new Promise((r) => setTimeout(r, 250))
     loop.stop()
 
-    expect(keychain.refreshToken).toHaveBeenCalledTimes(1)
-    expect(oauthClient.fetchOAuthUsage).toHaveBeenCalledTimes(1)
+    expect(captured[0]?.data?.fiveHour?.utilization).toBe(48)
+    expect(captured[0]?.stale).toBe(true)
+    expect(keychain.refreshToken).not.toHaveBeenCalled()
+    expect(keychain.writeOpenCodeAuthTo).not.toHaveBeenCalled()
+    expect(oauthClient.fetchOAuthUsage).not.toHaveBeenCalled()
   })
 
   it("refetches immediately when auth.json holds a different account despite a fresh cache", async () => {
@@ -609,48 +696,32 @@ describe("createClaudeRefreshLoop (shared disk cache + single-flight)", () => {
     expect(oauthClient.fetchOAuthUsage).toHaveBeenCalledTimes(1)
   })
 
-  it("records a shared refresh-block when the rotated token cannot be persisted", async () => {
-    const cache = await import("../cache.js")
-    vi.mocked(keychain.listOpenCodeAuthFiles).mockReturnValue(["/pf/_auth.json"])
-    vi.mocked(keychain.readOpenCodeAuthFrom).mockReturnValue({ accessToken: "pfExpired", refreshToken: "R", expiresAt: 1 })
-    vi.mocked(keychain.isTokenExpired).mockImplementation((exp) => exp <= 1)
-    vi.mocked(keychain.writeOpenCodeAuthTo).mockReturnValue(false)
-    vi.mocked(keychain.refreshToken).mockResolvedValue({
-      accessToken: "pfFresh",
-      refreshToken: "rotR",
-      expiresAt: Date.now() + 3_600_000,
-      scopes: [],
-      subscriptionType: null,
-      rateLimitTier: null,
-      hasProfileScope: false,
+  it("does not show stale own cache for a VALID secondary whose account changed (stale is expired-only)", async () => {
+    vi.mocked(keychain.listOpenCodeAuthFiles).mockReturnValue(["/d/_auth.json"])
+    // _auth.json now holds a DIFFERENT, still-valid account token.
+    vi.mocked(keychain.readOpenCodeAuthFrom).mockReturnValue({ accessToken: "newAcct", refreshToken: "", expiresAt: Date.now() + 3_600_000 })
+    vi.mocked(oauthClient.fetchOAuthProfile).mockResolvedValue({ email: "new@x.com", name: "New", plan: null })
+    vi.mocked(oauthClient.fetchOAuthUsage).mockResolvedValue({ status: "rate_limited" })
+    // Stale own cache belongs to the PREVIOUS _auth.json account; identity must gate it.
+    writeRawCache({
+      claudeFiles: {
+        "_auth.json": storedEntry(Date.now() - 10 * 60_000, {
+          usage: usageAt(91),
+          profile: { email: "old@x.com", name: "Old", plan: null },
+          identity: "old@x.com",
+          authMethod: "oauth",
+          tokenHash: tokenHashOf("oldAcct"),
+        }),
+      },
     })
-    vi.mocked(oauthClient.fetchOAuthUsage).mockResolvedValue({ status: "ok", usage: USAGE })
 
     let captured: ClaudeAccount[] = []
     const loop = fetcher.createClaudeRefreshLoop((a) => { captured = a }, 60_000)
     loop.start()
-    await vi.waitFor(() => expect(captured[0]?.data?.fiveHour?.utilization).toBe(10))
+    await vi.waitFor(() => expect(captured[0]?.label).toBe("Claude (_auth.json, New)"))
     loop.stop()
 
-    const blockKey = `refresh-block:${tokenHashOf("pfExpired")}`
-    expect(cache.readCooldown(blockKey)).toBeGreaterThan(Date.now())
-  })
-
-  it("never reuses a refresh token that another process already burned (refresh-block)", async () => {
-    const cache = await import("../cache.js")
-    cache.writeCooldown(`refresh-block:${tokenHashOf("pfExpired")}`, Date.now() + 60_000)
-    vi.mocked(keychain.listOpenCodeAuthFiles).mockReturnValue(["/pf/_auth.json"])
-    vi.mocked(keychain.readOpenCodeAuthFrom).mockReturnValue({ accessToken: "pfExpired", refreshToken: "R", expiresAt: 1 })
-    vi.mocked(keychain.isTokenExpired).mockImplementation((exp) => exp <= 1)
-
-    let captured: ClaudeAccount[] = []
-    const loop = fetcher.createClaudeRefreshLoop((a) => { captured = a }, 60_000)
-    loop.start()
-    await vi.waitFor(() => expect(captured).toHaveLength(1))
-    loop.stop()
-
-    expect(keychain.refreshToken).not.toHaveBeenCalled()
-    expect(oauthClient.fetchOAuthUsage).not.toHaveBeenCalled()
+    expect(captured[0]?.data).toBeNull()
   })
 
   it("lets concurrent loops (multiple TUI processes) share a single fetch", async () => {

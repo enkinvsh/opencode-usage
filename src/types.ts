@@ -94,6 +94,8 @@ export interface ClaudeAccount {
   data: OAuthUsageResponse | null
   authMethod: AuthMethod
   error: string | null
+  /** Cached usage shown while a secondary token is expired and intentionally not refreshed: real but possibly out of date. */
+  stale?: boolean
 }
 
 export interface CodexUsageWindow {

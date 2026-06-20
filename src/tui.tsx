@@ -144,6 +144,13 @@ const tui: TuiPlugin = async (api, rawOptions, _meta) => {
             ? <box height={1}><text fg={dim}>{"Failed to fetch usage"}</text></box>
             : !acc.data
             ? <box height={1}><text fg={dim}>{"Loading..."}</text></box>
+            : acc.stale
+            ? (
+              <box flexDirection="column">
+                {renderClaudeWindows(acc.data)}
+                <box height={1}><text fg={dim}>{" cached \u2014 token expired"}</text></box>
+              </box>
+            )
             : renderClaudeWindows(acc.data)
 
           return (

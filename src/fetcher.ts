@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto"
 import { basename } from "node:path"
-import { readKeychainCredentials, readCredentialsFile, readOpenCodeAuth, readOpenCodeAuthFrom, listOpenCodeAuthFiles, refreshToken, isTokenExpired, writeOpenCodeAuthTo, isPrimaryAuthFile } from "./keychain"
+import { readKeychainCredentials, readCredentialsFile, readOpenCodeAuth, readOpenCodeAuthFrom, listOpenCodeAuthFiles, isTokenExpired, isPrimaryAuthFile } from "./keychain"
 import { fetchOAuthUsage, fetchOAuthProfile } from "./oauth-client"
 import { extractSessionKey, fetchWebUsage } from "./cookie-reader"
 import { detectClaude, probeCLIUsage, probeStatus } from "./cli-probe"
@@ -57,33 +57,12 @@ function rateLimitRetryDelayMs(): number {
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
-const REFRESH_LOCK_STALE_MS = 5 * 60 * 1000
-const REFRESH_BLOCK_MS = 8 * 60 * 60 * 1000
 
 function tokenHashOf(token: string): string {
   return createHash("sha256").update(token).digest("hex").slice(0, 32)
 }
 
 const failedTokens = new Set<string>()
-
-interface RefreshedTokenCache {
-  sourceAccessToken: string
-  accessToken: string
-  refreshToken: string
-  expiresAt: number
-}
-
-// In-memory record of tokens we rotated ourselves. Normally the rotated token
-// is persisted back to the auth file; this map is the safety net when that
-// write fails, so we never burn the same refresh token twice.
-const refreshedTokens = new Map<string, RefreshedTokenCache>()
-
-function validRefreshedAccessToken(cached: RefreshedTokenCache | null | undefined, sourceAccessToken: string): string | null {
-  if (!cached) return null
-  if (cached.sourceAccessToken !== sourceAccessToken) return null
-  if (isTokenExpired(cached.expiresAt)) return null
-  return cached.accessToken
-}
 
 interface OAuthAttempt {
   usage: OAuthUsageResponse | null
@@ -272,96 +251,28 @@ export async function fetchUsageData(): Promise<FetchResult> {
   return { usage: null, profile: null, authMethod: "none", identity: null, usageStatus: "unavailable" }
 }
 
-type RotationOutcome =
-  | { status: "ok"; accessToken: string }
-  | { status: "auth_failed" }
-  | { status: "unavailable" }
-  | { status: "missing" }
-
-/**
- * Rotate an expired _auth.json token. This is the single token-burn point of the plugin,
- * so it is wrapped in defense-in-depth layers on top of the caller's per-file fetch lock:
- *
- * 1. A shared "refresh-block" cooldown marks refresh tokens that were already used by a
- *    process that then FAILED to persist the rotation — reusing such a token would
- *    invalidate the whole token family. Blocked tokens are never refreshed again.
- * 2. A dedicated cross-process refresh lock serializes the refresh itself.
- * 3. The auth file is re-read under the lock, so a rotation persisted by another process
- *    (or by the user re-authenticating) is picked up instead of burning the refresh token.
- */
-async function rotateSecondaryToken(filePath: string, observedAccessToken: string): Promise<RotationOutcome> {
-  if (Date.now() < readCooldown(`refresh-block:${tokenHashOf(observedAccessToken)}`)) {
-    return { status: "unavailable" }
-  }
-  const lockKey = `refresh-${basename(filePath)}`
-  if (!tryAcquireFetchLock(lockKey, REFRESH_LOCK_STALE_MS)) {
-    return { status: "unavailable" }
-  }
-  try {
-    const latest = readOpenCodeAuthFrom(filePath)
-    if (!latest) return { status: "missing" }
-    if (!isTokenExpired(latest.expiresAt)) {
-      return { status: "ok", accessToken: latest.accessToken }
-    }
-    if (!latest.refreshToken) return { status: "auth_failed" }
-    const refreshed = await refreshToken(latest.refreshToken).catch(() => null)
-    if (!refreshed) return { status: "auth_failed" }
-    refreshedTokens.set(filePath, {
-      sourceAccessToken: latest.accessToken,
-      accessToken: refreshed.accessToken,
-      refreshToken: refreshed.refreshToken,
-      expiresAt: refreshed.expiresAt,
-    })
-    let persisted = false
-    try {
-      persisted = writeOpenCodeAuthTo(filePath, { accessToken: refreshed.accessToken, refreshToken: refreshed.refreshToken, expiresAt: refreshed.expiresAt })
-    } catch {
-      persisted = false
-    }
-    if (!persisted) {
-      writeCooldown(`refresh-block:${tokenHashOf(latest.accessToken)}`, Date.now() + REFRESH_BLOCK_MS)
-    }
-    return { status: "ok", accessToken: refreshed.accessToken }
-  } finally {
-    releaseFetchLock(lockKey)
-  }
-}
-
 /**
  * Fetch usage for a single OpenCode auth file (one Claude account). Each file is a distinct
  * account, so this never falls back to other auth sources. A transient 429 is surfaced
  * (usage null, usageStatus "rate_limited") so the caller keeps that account's last data.
  *
- * MUST be called while holding the per-file fetch lock: token rotation for _auth.json is
- * only safe when a single process at a time can use the (single-use) refresh token. The
- * auth file is re-read here, right before any refresh, so a rotation performed by another
- * process in the meantime is picked up instead of burning the refresh token again.
- *
- * The primary auth.json is NEVER refreshed or written by this plugin — OpenCode itself
- * owns that file and rotates its tokens.
+ * Neither auth file is ever refreshed or written by this plugin: OpenCode owns both
+ * auth.json and _auth.json and rotates their (single-use) tokens. An expired token is
+ * reported, never refreshed, so the caller falls back to that account's last cached usage.
+ * The expired secondary is reported as auth_failed only to drive the no-cache case to
+ * "not-configured"; syncOne serves the cached case before calling here.
  */
 async function fetchAccountUsage(filePath: string): Promise<FetchResult> {
   const auth = readOpenCodeAuthFrom(filePath)
   if (!auth) {
     return { usage: null, profile: null, authMethod: "none", identity: null, usageStatus: "unavailable" }
   }
-  let token = auth.accessToken
   if (isTokenExpired(auth.expiresAt)) {
-    if (isPrimaryAuthFile(filePath)) {
-      // OpenCode owns auth.json and will refresh it on its own; never touch it.
-      return { usage: null, profile: null, authMethod: "oauth", identity: null, usageStatus: "unavailable" }
-    }
-    const remembered = validRefreshedAccessToken(refreshedTokens.get(filePath), auth.accessToken)
-    if (remembered) {
-      token = remembered
-    } else {
-      const rotated = await rotateSecondaryToken(filePath, auth.accessToken)
-      if (rotated.status !== "ok") {
-        return { usage: null, profile: null, authMethod: rotated.status === "missing" ? "none" : "oauth", identity: null, usageStatus: rotated.status === "auth_failed" ? "auth_failed" : "unavailable" }
-      }
-      token = rotated.accessToken
-    }
+    return isPrimaryAuthFile(filePath)
+      ? { usage: null, profile: null, authMethod: "oauth", identity: null, usageStatus: "unavailable" }
+      : { usage: null, profile: null, authMethod: "oauth", identity: null, usageStatus: "auth_failed" }
   }
+  const token = auth.accessToken
   const attempt = await attemptOAuth(token)
   const identity = identityOf(attempt.profile)
   if (attempt.usageStatus === "ok" && attempt.usage) {
@@ -418,7 +329,7 @@ export function createClaudeRefreshLoop(
     return own ? { entry: own, trusted: false } : null
   }
 
-  function accountFromStored(id: string, base: string, stored: StoredAccountUsage, profile?: ProfileResponse | null): ClaudeAccount {
+  function accountFromStored(id: string, base: string, stored: StoredAccountUsage, profile?: ProfileResponse | null, stale = false): ClaudeAccount {
     return {
       id,
       label: labelFor(base, profile ?? stored.profile),
@@ -426,6 +337,7 @@ export function createClaudeRefreshLoop(
       data: stored.usage,
       authMethod: stored.authMethod,
       error: null,
+      stale,
     }
   }
 
@@ -457,10 +369,19 @@ export function createClaudeRefreshLoop(
     if (!auth) {
       return { id: file, label: labelFor(base, null), status: "not-configured", data: null, authMethod: "none", error: null }
     }
-    const preToken = validRefreshedAccessToken(refreshedTokens.get(file), auth.accessToken) ?? auth.accessToken
-    const tokenHash = tokenHashOf(preToken)
+    const tokenHash = tokenHashOf(auth.accessToken)
     const resolved = entryFor(base, tokenHash)
     const now = Date.now()
+
+    // Expired secondary _auth.json: OpenCode owns the file and its refresh token is
+    // single-use, so the plugin must never refresh or write it. No live fetch is
+    // possible, so render this file's last cached usage as stale instead of dropping
+    // the account; with no cache there is nothing to show but "not-configured".
+    if (!isPrimaryAuthFile(file) && isTokenExpired(auth.expiresAt)) {
+      if (resolved) return accountFromStored(file, base, resolved.entry.result, undefined, true)
+      return { id: file, label: labelFor(base, null), status: "not-configured", data: null, authMethod: "none", error: null }
+    }
+
     const fresh = resolved !== null && resolved.trusted && now - resolved.entry.timestamp < intervalMs
     const coolingDown = now < readCooldown(`claude:${tokenHash}`)
 
@@ -468,7 +389,7 @@ export function createClaudeRefreshLoop(
       try {
         const result = await fetchAccountUsage(file)
         if (result.usageStatus === "ok" && result.usage) {
-          const effHash = tokenHashOf(result.effectiveAccessToken ?? preToken)
+          const effHash = tokenHashOf(result.effectiveAccessToken ?? auth.accessToken)
           const stored: StoredAccountUsage = {
             usage: result.usage,
             profile: result.profile,
@@ -480,7 +401,7 @@ export function createClaudeRefreshLoop(
           return accountFromStored(file, base, stored)
         }
         if (result.usageStatus === "rate_limited") {
-          const effHash = tokenHashOf(result.effectiveAccessToken ?? preToken)
+          const effHash = tokenHashOf(result.effectiveAccessToken ?? auth.accessToken)
           const cooldownMs = result.retryAfterMs !== undefined && result.retryAfterMs > 0
             ? result.retryAfterMs
             : result.retryAfterMs === 0
