@@ -29,6 +29,42 @@ Click either header (`▼`/`▶`) to collapse that section independently.
 
 ## Install
 
+> [!WARNING]
+> **opencode 1.17.10 breaks TUI plugins installed by npm package spec** ([anomalyco/opencode#33884](https://github.com/anomalyco/opencode/issues/33884)): the sidebar silently never renders. It is an opencode-side regression (OpenTUI 0.3.4 → 0.4.2) that affects *every* npm-spec TUI plugin — not just this one — and is slated to be fixed in a future opencode release. **Until then, use the `file://` workaround below.** The plain npm install further down works again once that fix ships.
+
+### Workaround: `file://` install (opencode 1.17.10)
+
+A `file://` path lives outside `node_modules`, so opencode runs its Solid JSX transform on it and binds it to the host renderer — exactly why it loads when the npm spec does not. Clone the repo and point opencode at the local source:
+
+```bash
+git clone https://github.com/coin-seeker/opencode-usage.git ~/.opencode-plugins/opencode-usage
+cd ~/.opencode-plugins/opencode-usage && npm install
+```
+
+Then set **`~/.config/opencode/tui.json`** to the absolute local path (replace any `opencode-usage-sidebar` entry, and use *your* real home directory):
+
+```json
+{
+  "$schema": "https://opencode.ai/tui.json",
+  "plugin": [
+    ["file:///Users/YOU/.opencode-plugins/opencode-usage/src/tui.tsx", { "enabled": true }]
+  ]
+}
+```
+
+Restart opencode. Update later with `git -C ~/.opencode-plugins/opencode-usage pull`. Options work the same way — pass them as the second element of the entry (see [Options](#options)).
+
+#### Let an AI agent switch it for you
+
+Already installed via the npm spec? Paste this to your opencode / Claude agent and it will do the switch:
+
+> opencode 1.17.10 has bug #33884 that silently breaks npm-spec TUI plugins. Set up `opencode-usage-sidebar` as a local `file://` plugin instead:
+> 1. Clone & install: `git clone https://github.com/coin-seeker/opencode-usage.git ~/.opencode-plugins/opencode-usage && cd ~/.opencode-plugins/opencode-usage && npm install`
+> 2. Edit `~/.config/opencode/tui.json`: remove any plugin entry whose name starts with `opencode-usage-sidebar`, and add `["file://<ABS_PATH>/src/tui.tsx", { "enabled": true }]`, where `<ABS_PATH>` is the clone's real absolute path (expand `~` to my home directory). Keep my other plugins and any options I already had.
+> 3. Then tell me to restart opencode and confirm the **Claude Usage** / **Codex Usage** panels appear.
+
+---
+
 Paste below into your OpenCode.
 
 ```
