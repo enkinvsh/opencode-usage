@@ -1,4 +1,4 @@
-import type { OAuthUsageResponse, ProfileResponse, UsageFetchResult } from "./types"
+import type { OAuthUsageResponse, OAuthUsageWindow, OAuthLimit, ProfileResponse, UsageFetchResult } from "./types"
 
 const BASE_URL = "https://api.anthropic.com"
 const BETA_HEADER = "oauth-2025-04-20"
@@ -48,6 +48,29 @@ export function snakeToCamel(obj: unknown): unknown {
 }
 
 /**
+ * Extract a scoped per-model window (e.g. Fable) from the newer `limits` array.
+ * Fable and other Claude 5 per-model windows appear ONLY here — not in the legacy
+ * top-level `seven_day_*` keys — so this is the single source for them. Matches on
+ * the model display name, case-insensitively.
+ */
+export function extractScopedWindow(
+  limits: OAuthLimit[] | null | undefined,
+  modelName: string,
+): OAuthUsageWindow | null {
+  if (!Array.isArray(limits)) return null
+  for (const limit of limits) {
+    const displayName = limit?.scope?.model?.displayName
+    if (typeof displayName === "string" && displayName.toLowerCase() === modelName.toLowerCase()) {
+      return {
+        utilization: typeof limit.percent === "number" ? limit.percent : null,
+        resetsAt: typeof limit.resetsAt === "string" ? limit.resetsAt : null,
+      }
+    }
+  }
+  return null
+}
+
+/**
  * Fetch Claude usage data via OAuth API.
  *
  * Distinguishes HTTP 429 (transient rate limit, common when the same account is
@@ -74,7 +97,9 @@ export async function fetchOAuthUsage(accessToken: string): Promise<UsageFetchRe
 
   try {
     const raw = await response.json() as Record<string, unknown>
-    return { status: "ok", usage: snakeToCamel(raw) as OAuthUsageResponse }
+    const usage = snakeToCamel(raw) as OAuthUsageResponse
+    usage.sevenDayFable = extractScopedWindow(usage.limits, "Fable") ?? usage.sevenDayFable ?? null
+    return { status: "ok", usage }
   } catch {
     return { status: "unavailable" }
   }

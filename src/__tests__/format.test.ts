@@ -88,6 +88,10 @@ describe("windowLabel", () => {
     expect(windowLabel("sevenDay")).toBe("Weekly")
   })
 
+  it("maps sevenDayFable → Fable", () => {
+    expect(windowLabel("sevenDayFable")).toBe("Fable")
+  })
+
   it("maps sevenDaySonnet → Sonnet", () => {
     expect(windowLabel("sevenDaySonnet")).toBe("Sonnet")
   })

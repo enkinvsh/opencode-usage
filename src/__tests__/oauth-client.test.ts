@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest"
-import { snakeToCamel, fetchOAuthUsage, fetchOAuthProfile } from "../oauth-client.js"
+import { snakeToCamel, fetchOAuthUsage, fetchOAuthProfile, extractScopedWindow } from "../oauth-client.js"
+import type { OAuthLimit } from "../types.js"
 
 describe("snakeToCamel", () => {
   it("converts snake_case keys to camelCase", () => {
@@ -60,6 +61,73 @@ describe("fetchOAuthUsage", () => {
       expect(result.usage.fiveHour?.utilization).toBe(45)
       expect(result.usage.sevenDay?.utilization).toBe(62)
     }
+  })
+
+  it("derives sevenDayFable from the weekly_scoped Fable entry in the limits array", async () => {
+    // Real API shape: Fable appears ONLY in `limits`, not as a top-level seven_day_* key.
+    const rawBody = JSON.stringify({
+      five_hour: { utilization: 21, resets_at: "2026-07-14T10:19:59Z" },
+      seven_day: { utilization: 81, resets_at: "2026-07-14T18:59:59Z" },
+      seven_day_opus: null,
+      seven_day_sonnet: null,
+      limits: [
+        { kind: "session", group: "session", percent: 21, severity: "normal", resets_at: "2026-07-14T10:19:59Z", scope: null, is_active: false },
+        { kind: "weekly_all", group: "weekly", percent: 81, severity: "warning", resets_at: "2026-07-14T18:59:59Z", scope: null, is_active: false },
+        { kind: "weekly_scoped", group: "weekly", percent: 99, severity: "critical", resets_at: "2026-07-14T18:59:59Z", scope: { model: { id: null, display_name: "Fable" }, surface: null }, is_active: true },
+      ],
+    })
+    vi.mocked(fetch).mockResolvedValue(new Response(rawBody, { status: 200 }))
+    const result = await fetchOAuthUsage("valid-token")
+    expect(result.status).toBe("ok")
+    if (result.status === "ok") {
+      expect(result.usage.sevenDayFable?.utilization).toBe(99)
+      expect(result.usage.sevenDayFable?.resetsAt).toBe("2026-07-14T18:59:59Z")
+    }
+  })
+
+  it("leaves sevenDayFable null when no Fable-scoped limit is present", async () => {
+    const rawBody = JSON.stringify({
+      five_hour: { utilization: 5, resets_at: "2026-07-14T10:19:59Z" },
+      limits: [
+        { kind: "session", group: "session", percent: 5, severity: "normal", resets_at: "2026-07-14T10:19:59Z", scope: null, is_active: false },
+      ],
+    })
+    vi.mocked(fetch).mockResolvedValue(new Response(rawBody, { status: 200 }))
+    const result = await fetchOAuthUsage("valid-token")
+    expect(result.status).toBe("ok")
+    if (result.status === "ok") {
+      expect(result.usage.sevenDayFable).toBeNull()
+    }
+  })
+})
+
+describe("extractScopedWindow", () => {
+  const fableLimit: OAuthLimit = {
+    kind: "weekly_scoped", group: "weekly", percent: 99, severity: "critical",
+    resetsAt: "2026-07-14T18:59:59Z",
+    scope: { model: { id: null, displayName: "Fable" }, surface: null },
+    isActive: true,
+  }
+
+  it("finds a scoped window by model display name, case-insensitively", () => {
+    expect(extractScopedWindow([fableLimit], "fable")).toEqual({
+      utilization: 99,
+      resetsAt: "2026-07-14T18:59:59Z",
+    })
+  })
+
+  it("returns null for a missing model, empty array, or null input", () => {
+    expect(extractScopedWindow([fableLimit], "Opus")).toBeNull()
+    expect(extractScopedWindow([], "Fable")).toBeNull()
+    expect(extractScopedWindow(null, "Fable")).toBeNull()
+    expect(extractScopedWindow(undefined, "Fable")).toBeNull()
+  })
+
+  it("coerces a non-numeric percent or missing resetsAt to null", () => {
+    const partial: OAuthLimit = {
+      ...fableLimit, percent: null, resetsAt: null,
+    }
+    expect(extractScopedWindow([partial], "Fable")).toEqual({ utilization: null, resetsAt: null })
   })
 })
 

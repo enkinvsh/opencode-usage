@@ -36,6 +36,7 @@ vi.mock("../cli-probe.js", () => ({
 const USAGE: OAuthUsageResponse = {
   fiveHour: { utilization: 10, resetsAt: null },
   sevenDay: null,
+  sevenDayFable: null,
   sevenDaySonnet: null,
   sevenDayOpus: null,
   sevenDayDesign: null,

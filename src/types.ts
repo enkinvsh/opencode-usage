@@ -12,15 +12,46 @@ export interface OAuthExtraUsage {
   currency: string | null
 }
 
+/** One model within a scoped usage limit (limits[].scope.model). */
+export interface OAuthLimitModel {
+  id: string | null
+  displayName: string | null
+}
+
+export interface OAuthLimitScope {
+  model: OAuthLimitModel | null
+  surface: string | null
+}
+
+/**
+ * One entry of the `limits` array — the newer usage format Anthropic introduced
+ * with the Claude 5 family. Per-model windows (e.g. Fable) appear ONLY here, as a
+ * `weekly_scoped` entry with `scope.model.displayName`, and are absent from the
+ * legacy top-level `seven_day_*` keys.
+ */
+export interface OAuthLimit {
+  kind: string | null
+  group: string | null
+  percent: number | null
+  severity: string | null
+  resetsAt: string | null
+  scope: OAuthLimitScope | null
+  isActive: boolean | null
+}
+
 export interface OAuthUsageResponse {
   fiveHour: OAuthUsageWindow | null
   sevenDay: OAuthUsageWindow | null
+  /** Fable per-model weekly window, derived from the `limits` array (new Claude 5 format). */
+  sevenDayFable: OAuthUsageWindow | null
   sevenDaySonnet: OAuthUsageWindow | null
   sevenDayOpus: OAuthUsageWindow | null
   sevenDayDesign: OAuthUsageWindow | null
   sevenDayRoutines: OAuthUsageWindow | null
   sevenDayOAuthApps: OAuthUsageWindow | null
   extraUsage: OAuthExtraUsage | null
+  /** Raw newer-format limit windows; source for scoped per-model windows like Fable. */
+  limits?: OAuthLimit[] | null
 }
 
 export type UsageFetchStatus = "ok" | "rate_limited" | "auth_failed" | "unavailable"

@@ -14,6 +14,7 @@ const CODEX_AMBER = "#5FC2A8"
 const CLAUDE_WINDOW_KEYS = [
   "fiveHour",
   "sevenDay",
+  "sevenDayFable",
   "sevenDaySonnet",
   "sevenDayOpus",
   "sevenDayDesign",

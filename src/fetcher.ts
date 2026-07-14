@@ -207,6 +207,7 @@ export async function fetchUsageData(): Promise<FetchResult> {
           sevenDay: probeResult.weeklyPercent !== null
             ? { utilization: probeResult.weeklyPercent, resetsAt: probeResult.weeklyReset }
             : null,
+          sevenDayFable: null,
           sevenDaySonnet: probeResult.sonnetPercent !== null
             ? { utilization: probeResult.sonnetPercent, resetsAt: null }
             : null,

@@ -7,6 +7,7 @@ An [opencode](https://opencode.ai) TUI sidebar plugin that displays your **Claud
 ▼ Claude Usage
  Session      31%  resets in 3h 16m
  Weekly       11%  resets in 4d 5h
+ Fable        99%  resets in 2d 3h
  Sonnet        2%  resets in 6d 21h
 
 ▼ Codex Usage
@@ -19,6 +20,7 @@ An [opencode](https://opencode.ai) TUI sidebar plugin that displays your **Claud
 ▼ Claude Usage
  Session  █████░░░░░░░░░  31% (3h 16m)
  Weekly   ██░░░░░░░░░░░░  11% (4d 5h)
+ Fable    █████████████  99% (2d 3h)
 
 ▼ Codex Usage
  Session  ░░░░░░░░░░░░░░   1% (4h 51m)
@@ -127,6 +129,13 @@ account's data never appears under another. The active account's usage endpoint 
 rate limited (HTTP 429) while OpenCode is using it for inference; the plugin honors the
 server `Retry-After`, keeps that account's last known data during the cooldown, and never
 falls back to a different account.
+
+**Per-model windows (Fable).** Beyond Session and Weekly, each Claude section shows any
+per-model weekly window the account is currently using — including **Fable**, Anthropic's
+Claude 5 flagship. Fable reports through Anthropic's newer usage format (the `limits` array,
+as a `weekly_scoped` entry) rather than the legacy top-level keys, so the plugin reads it from
+there. Rows only appear when the account has usage on that model, so most sections show just
+Session and Weekly until you use Fable, Sonnet, or Opus on their own weekly caps.
 
 When no OpenCode auth file exists, a single Claude section is fetched via a 6-step fallback chain:
 

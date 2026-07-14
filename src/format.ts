@@ -201,6 +201,7 @@ export function windowLabel(key: string): string {
   const labels: Record<string, string> = {
     fiveHour: "Session",
     sevenDay: "Weekly",
+    sevenDayFable: "Fable",
     sevenDaySonnet: "Sonnet",
     sevenDayOpus: "Opus",
     sevenDayDesign: "Design",

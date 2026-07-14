@@ -5,7 +5,7 @@ import { readdir, stat } from "node:fs/promises"
 import { homedir, tmpdir } from "node:os"
 import { join } from "node:path"
 import type { OAuthUsageResponse } from "./types"
-import { snakeToCamel } from "./oauth-client"
+import { snakeToCamel, extractScopedWindow } from "./oauth-client"
 
 function getChromeCookieDb(): string | null {
   switch (process.platform) {
@@ -247,7 +247,9 @@ export async function fetchWebUsage(sessionKey: string): Promise<OAuthUsageRespo
       if (!usageResp.ok) return null
 
       const raw = await usageResp.json() as Record<string, unknown>
-      return snakeToCamel(raw) as OAuthUsageResponse
+      const usage = snakeToCamel(raw) as OAuthUsageResponse
+      usage.sevenDayFable = extractScopedWindow(usage.limits, "Fable") ?? usage.sevenDayFable ?? null
+      return usage
     } catch {
       clearTimeout(t2)
       return null
