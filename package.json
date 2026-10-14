@@ -24,7 +24,8 @@
     "src/fetcher.ts",
     "src/codex-auth.ts",
     "src/codex-oauth-client.ts",
-    "src/codex-fetcher.ts"
+    "src/codex-fetcher.ts",
+    "src/antigravity-fetcher.ts"
   ],
   "scripts": {
     "test": "vitest run",

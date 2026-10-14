@@ -13,7 +13,9 @@ const DISPLAY_MAX_AGE_MS = 24 * 60 * 60 * 1000
 // A fetch lock left behind by a crashed process is taken over after this long.
 const FETCH_LOCK_STALE_MS = 90_000
 
-export type CacheNamespace = "claude" | "codex"
+// antigravityPool — отдельный ключ, а не antigravity: там лежит кэш старой
+// формы (один аккаунт), и новый рендер упал бы на нём.
+export type CacheNamespace = "claude" | "codex" | "antigravityPool"
 
 export interface NamespaceEntry<T> {
   timestamp: number
@@ -23,6 +25,7 @@ export interface NamespaceEntry<T> {
 interface CacheFile {
   claude?: NamespaceEntry<unknown>
   codex?: NamespaceEntry<unknown>
+  antigravityPool?: NamespaceEntry<unknown>
   /** Per OpenCode auth file (key: basename, e.g. "auth.json" / "_auth.json"). */
   claudeFiles?: Record<string, NamespaceEntry<unknown>>
   /** Server rate-limit cooldowns shared across processes (key → epoch ms until which fetching is forbidden). */

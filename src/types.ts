@@ -190,6 +190,26 @@ export interface CodexState {
   error: string | null
 }
 
+export interface AntigravityWindow { usedPercent: number | null; resetAt: string | null }
+export interface AntigravityQuota { groupName: string | null; fiveHour: AntigravityWindow | null; weekly: AntigravityWindow | null }
+/** quota === null — аккаунт не ответил (протух токен, 403, таймаут). */
+export interface AntigravityAccount { id: string; quota: AntigravityQuota | null }
+/**
+ * Google отдаёт только долю остатка, без абсолютных чисел, поэтому пул меряется
+ * в «аккаунт-эквивалентах»: remainingAccounts = сумма остатков по аккаунтам.
+ * Ultra считается одним аккаунтом наравне с Pro (его недельный лимит больше,
+ * но во сколько раз — Google не публикует).
+ */
+export interface AntigravityPoolWindow { usedPercent: number; remainingAccounts: number; counted: number; nextResetAt: string | null }
+export interface AntigravityPool {
+  accounts: AntigravityAccount[]
+  fiveHour: AntigravityPoolWindow | null
+  weekly: AntigravityPoolWindow | null
+  /** Аккаунты, у которых выбито хотя бы одно окно (5h или weekly). */
+  exhausted: number
+}
+export interface AntigravityState { status: FetchStatus; data: AntigravityPool | null; stale: boolean; error: string | null }
+
 // Plugin configuration options (from tui.json)
 export type DisplayMode = "text" | "bar"
 
@@ -202,4 +222,14 @@ export interface PluginOptions {
   showClaude?: boolean
   showCodex?: boolean
   codexHeaderColor?: string
+  /** Секция Antigravity по умолчанию выключена: ей нужен ssh-хост с файлом аккаунта. */
+  showAntigravity?: boolean
+  antigravitySshHost?: string
+  /** Каталог пула кредов cliproxyapi: берутся все antigravity-*.json. Приоритетнее antigravityAuthFile. */
+  antigravityAuthDir?: string
+  antigravityAuthFile?: string
+  /** Аккаунты с подпиской AI Ultra (отдают Argon) — помечаются «· U» в списке пула. */
+  antigravityUltraAccounts?: string[]
+  antigravityLabel?: string
+  antigravityHeaderColor?: string
 }
