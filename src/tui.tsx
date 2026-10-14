@@ -1,15 +1,18 @@
 /** @jsxImportSource @opentui/solid */
 import { createSignal } from "solid-js"
 import type { TuiPlugin, TuiPluginModule, TuiSlotContext } from "@opencode-ai/plugin/tui"
-import type { ClaudeAccount, CodexState, PluginOptions, OAuthUsageResponse } from "./types"
+import type { AntigravityAccount, AntigravityPoolWindow, AntigravityState, ClaudeAccount, CodexState, PluginOptions, OAuthUsageResponse } from "./types"
 import { createClaudeRefreshLoop } from "./fetcher"
 import { createCodexRefreshLoop } from "./codex-fetcher"
+import { accountIdFromFile, createAntigravityRefreshLoop } from "./antigravity-fetcher"
 import { formatRelativeTime, formatPercentage, formatBar, formatCost, windowLabel } from "./format"
 
 const CLAUDE_ORANGE = "#E07A3A"
 const CLAUDE_AMBER = "#F0A875"
 const CODEX_GREEN = "#10A37F"
 const CODEX_AMBER = "#5FC2A8"
+const ANTIGRAVITY_BLUE = "#4285F4"
+const ANTIGRAVITY_AMBER = "#8AB4F8"
 
 const CLAUDE_WINDOW_KEYS = [
   "fiveHour",
@@ -37,6 +40,10 @@ const tui: TuiPlugin = async (api, rawOptions, _meta) => {
   const showClaude = options.showClaude !== false
   const showCodex = options.showCodex !== false
   const codexHeaderColor = options.codexHeaderColor ?? CODEX_GREEN
+  const showAntigravity = options.showAntigravity === true
+  const antigravityLabel = options.antigravityLabel ?? "Antigravity Usage"
+  const antigravityHeaderColor = options.antigravityHeaderColor ?? ANTIGRAVITY_BLUE
+  const antigravityUltra = new Set((options.antigravityUltraAccounts ?? []).map(accountIdFromFile))
 
   const [claudeAccounts, setClaudeAccounts] = createSignal<ClaudeAccount[]>([])
   const [claudeCollapsed, setClaudeCollapsed] = createSignal<Record<string, boolean>>({})
@@ -70,15 +77,32 @@ const tui: TuiPlugin = async (api, rawOptions, _meta) => {
     setCodexState(s)
   }
 
+  const [antigravityState, setAntigravityState] = createSignal<AntigravityState>({
+    status: "idle",
+    data: null,
+    stale: false,
+    error: null,
+  })
+  const [antigravityOpen, setAntigravityOpen] = createSignal(true)
+  const [antigravityAccountsOpen, setAntigravityAccountsOpen] = createSignal(false)
+
   const claudeLoop = createClaudeRefreshLoop(setClaudeAccounts, refreshIntervalMs)
   const codexLoop = createCodexRefreshLoop(wrappedSetCodexState, refreshIntervalMs)
 
   if (showClaude) claudeLoop.start()
   if (showCodex) codexLoop.start()
 
+  const antigravityLoop = createAntigravityRefreshLoop(setAntigravityState, refreshIntervalMs, {
+    sshHost: options.antigravitySshHost,
+    authDir: options.antigravityAuthDir,
+    authFile: options.antigravityAuthFile,
+  })
+  if (showAntigravity) antigravityLoop.start()
+
   api.lifecycle.onDispose(() => {
     claudeLoop.stop()
     codexLoop.stop()
+    antigravityLoop.stop()
     if (codexTickTimer) clearInterval(codexTickTimer)
   })
 
@@ -284,10 +308,132 @@ const tui: TuiPlugin = async (api, rawOptions, _meta) => {
           )
         }
 
+        const antigravityPctColor = (pct: number | null) => pct === null ? valueFg
+          : pct >= 80 ? antigravityHeaderColor
+          : pct >= 51 ? ANTIGRAVITY_AMBER
+          : valueFg
+
+        // Для пула в строку добавляется «3.4/4» (остаток в аккаунтах); бар
+        // укорочен, чтобы строка осталась той же ширины, что у Claude/Codex.
+        const POOL_BAR_WIDTH = 8
+
+        const renderAntigravityRow = (label: string, w: AntigravityPoolWindow, poolSize: number) => {
+          const pct = w.usedPercent
+          const pctColor = antigravityPctColor(pct)
+          const share = poolSize > 1 ? ` ${w.remainingAccounts.toFixed(1)}/${w.counted}` : ""
+          const resetStr = formatRelativeTime(w.nextResetAt)
+          const hasReset = resetStr !== "—"
+
+          if (displayMode === "bar") {
+            const bar = formatBar(pct, poolSize > 1 ? POOL_BAR_WIDTH : undefined)
+            return (
+              <box height={1} flexDirection="row">
+                <text fg={fg}>{` ${label.padEnd(8)}`}</text>
+                <text fg={pctColor}>{bar.filled + bar.empty + formatPercentage(pct).padStart(4)}</text>
+                <text fg={valueFg}>{share}</text>
+                <text fg={dim}>{hasReset ? ` (${resetStr})` : ""}</text>
+              </box>
+            )
+          }
+
+          return (
+            <box height={1} flexDirection="row">
+              <text fg={fg}>{` ${label.padEnd(9)}`}</text>
+              <text fg={pctColor}>{formatPercentage(pct).padStart(5)}</text>
+              <text fg={valueFg}>{share}</text>
+              <text fg={dim}>{hasReset ? `  resets in ${resetStr}` : ""}</text>
+            </box>
+          )
+        }
+
+        // 14 вмещает и самое длинное имя (acct-alpha-01, 13), и «ultra-acct · U» (14),
+        // чтобы колонки S и W стояли ровно.
+        const ACCOUNT_NAME_WIDTH = 14
+        const ULTRA_SUFFIX = " \u00B7 U"
+
+        const renderAntigravityAccount = (a: AntigravityAccount) => {
+          const isUltra = antigravityUltra.has(a.id)
+          const maxId = isUltra ? ACCOUNT_NAME_WIDTH - ULTRA_SUFFIX.length : ACCOUNT_NAME_WIDTH
+          const id = a.id.slice(0, maxId)
+          const pad = " ".repeat(ACCOUNT_NAME_WIDTH - id.length - (isUltra ? ULTRA_SUFFIX.length : 0))
+          const nameNodes = (
+            <>
+              <text fg={fg}>{` ${id}`}</text>
+              {isUltra ? <text fg={antigravityHeaderColor}>{ULTRA_SUFFIX}</text> : null}
+              {pad ? <text fg={fg}>{pad}</text> : null}
+            </>
+          )
+          if (!a.quota) {
+            return (
+              <box height={1} flexDirection="row">
+                {nameNodes}
+                <text fg={dim}>{" нет данных"}</text>
+              </box>
+            )
+          }
+          const session = a.quota.fiveHour?.usedPercent ?? null
+          const weekly = a.quota.weekly?.usedPercent ?? null
+          return (
+            <box height={1} flexDirection="row">
+              {nameNodes}
+              <text fg={dim}>{" S"}</text>
+              <text fg={antigravityPctColor(session)}>{formatPercentage(session).padStart(5)}</text>
+              <text fg={dim}>{"  W"}</text>
+              <text fg={antigravityPctColor(weekly)}>{formatPercentage(weekly).padStart(5)}</text>
+            </box>
+          )
+        }
+
+        const renderAntigravity = () => {
+          const s = antigravityState()
+          const hint = s.status === "not-configured" ? "Set antigravitySshHost and antigravityAuthDir"
+            : s.status === "error" && !s.data ? "Failed to fetch usage"
+            : !s.data ? "Loading..."
+            : null
+
+          if (hint !== null || !s.data) {
+            return (
+              <box flexDirection="column">
+                <box height={1}><text fg={antigravityHeaderColor}><b>{antigravityLabel}</b></text></box>
+                <box height={1}><text fg={dim}>{hint ?? "Loading..."}</text></box>
+              </box>
+            )
+          }
+
+          const data = s.data
+          const isOpen = antigravityOpen()
+          const poolSize = data.accounts.length
+          const accountsOpen = antigravityAccountsOpen()
+          return (
+            <box flexDirection="column">
+              <box height={1} flexDirection="row" onMouseDown={() => setAntigravityOpen(!antigravityOpen())}>
+                <text fg={antigravityHeaderColor}>
+                  <b>{isOpen ? "\u25BC" : "\u25B6"}{" "}{antigravityLabel}{poolSize > 1 ? ` \u00D7${poolSize}` : ""}</b>
+                </text>
+              </box>
+              {isOpen ? (
+                <box flexDirection="column">
+                  {data.fiveHour ? renderAntigravityRow("Session", data.fiveHour, poolSize) : null}
+                  {data.weekly ? renderAntigravityRow("Weekly", data.weekly, poolSize) : null}
+                  {poolSize > 1 ? (
+                    <box height={1} flexDirection="row" onMouseDown={() => setAntigravityAccountsOpen(!antigravityAccountsOpen())}>
+                      <text fg={data.exhausted > 0 ? antigravityHeaderColor : dim}>{` выбиты ${data.exhausted}/${poolSize}`}</text>
+                      <text fg={dim}>{` \u00B7 ${accountsOpen ? "\u25BC" : "\u25B6"} аккаунты`}</text>
+                    </box>
+                  ) : null}
+                  {poolSize > 1 && accountsOpen ? data.accounts.map(renderAntigravityAccount) : null}
+                  {s.stale ? <box height={1}><text fg={dim}>{" cached \u2014 fetch failed"}</text></box> : null}
+                </box>
+              ) : null}
+            </box>
+          )
+        }
+
         return (
           <box flexDirection="column" gap={1}>
             {showClaude ? renderClaude() : null}
             {showCodex ? renderCodex() : null}
+            {showAntigravity ? renderAntigravity() : null}
           </box>
         ) as unknown as ReturnType<typeof renderClaude>
       },
