@@ -404,6 +404,11 @@ const tui: TuiPlugin = async (api, rawOptions, _meta) => {
           const isOpen = antigravityOpen()
           const poolSize = data.accounts.length
           const accountsOpen = antigravityAccountsOpen()
+          // Ultra-аккаунт держит основной расход (Argon), поэтому его S/W видны
+          // без раскрытия списка; в самом списке он не дублируется. Для пула из
+          // одного аккаунта строки Session/Weekly уже и есть его лимиты.
+          const pinned = poolSize > 1 ? data.accounts.filter((a) => antigravityUltra.has(a.id)) : []
+          const others = poolSize > 1 ? data.accounts.filter((a) => !antigravityUltra.has(a.id)) : []
           return (
             <box flexDirection="column">
               <box height={1} flexDirection="row" onMouseDown={() => setAntigravityOpen(!antigravityOpen())}>
@@ -415,13 +420,14 @@ const tui: TuiPlugin = async (api, rawOptions, _meta) => {
                 <box flexDirection="column">
                   {data.fiveHour ? renderAntigravityRow("Session", data.fiveHour, poolSize) : null}
                   {data.weekly ? renderAntigravityRow("Weekly", data.weekly, poolSize) : null}
+                  {pinned.map(renderAntigravityAccount)}
                   {poolSize > 1 ? (
                     <box height={1} flexDirection="row" onMouseDown={() => setAntigravityAccountsOpen(!antigravityAccountsOpen())}>
                       <text fg={data.exhausted > 0 ? antigravityHeaderColor : dim}>{` выбиты ${data.exhausted}/${poolSize}`}</text>
                       <text fg={dim}>{` \u00B7 ${accountsOpen ? "\u25BC" : "\u25B6"} аккаунты`}</text>
                     </box>
                   ) : null}
-                  {poolSize > 1 && accountsOpen ? data.accounts.map(renderAntigravityAccount) : null}
+                  {poolSize > 1 && accountsOpen ? others.map(renderAntigravityAccount) : null}
                   {s.stale ? <box height={1}><text fg={dim}>{" cached \u2014 fetch failed"}</text></box> : null}
                 </box>
               ) : null}
