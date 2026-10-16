@@ -6,13 +6,20 @@ import type { AntigravityAccount, AntigravityPool, AntigravityPoolWindow, Antigr
 // для аккаунта с подпиской — квота видна только "родному" клиенту.
 export const ANTIGRAVITY_USER_AGENT = "antigravity/1.104.0 darwin/arm64"
 
-// sandbox-хост первым: прод-хост cloudcode-pa отвечал 429 на 2026-10-13,
-// а daily-* отдают ту же квоту того же аккаунта.
+// 2026-10-13 прод-хост cloudcode-pa отвечал 429, а daily-* отдавали ту же квоту.
+// 2026-10-17 наоборот: daily-* отвечают 200, но только с группой «Claude and GPT
+// models» (3p-*) без Gemini, а прод отдаёт обе группы. Поэтому прод первым, а
+// ответ без Gemini-группы считается неудачей хоста (см. GEMINI_GROUP_JQ).
 export const ANTIGRAVITY_QUOTA_HOSTS = [
+  "cloudcode-pa.googleapis.com",
   "daily-cloudcode-pa.sandbox.googleapis.com",
   "daily-cloudcode-pa.googleapis.com",
-  "cloudcode-pa.googleapis.com",
 ] as const
+
+// Тот же критерий, что у parseQuotaSummary: группа с gemini-* бакетом или
+// «gemini» в имени. Без этой проверки 200 с чужой группой обрывает перебор
+// хостов, и аккаунт навсегда показывается как «нет данных».
+const GEMINI_GROUP_JQ = `[.groups[]? | (.displayName // ""), (.buckets[]?.bucketId // "")] | any(test("gemini"; "i"))`
 
 const SSH_TIMEOUT_MS = 30_000
 const SSH_MAX_BUFFER = 1024 * 1024
@@ -59,7 +66,7 @@ export function buildRemoteScript(source: AntigravitySource): string {
     `    out=""`,
     `    if [ -n "$tok" ] && [ "$tok" != "null" ]; then`,
     `      for h in ${hosts}; do`,
-    `        out=$(printf 'Authorization: Bearer %s\\n' "$tok" | curl -fsS -m 8 -H @- -H 'Content-Type: application/json' -A ${shellQuote(ANTIGRAVITY_USER_AGENT)} -X POST "https://$h/v1internal:retrieveUserQuotaSummary" -d '{}') && break`,
+    `        out=$(printf 'Authorization: Bearer %s\\n' "$tok" | curl -fsS -m 8 -H @- -H 'Content-Type: application/json' -A ${shellQuote(ANTIGRAVITY_USER_AGENT)} -X POST "https://$h/v1internal:retrieveUserQuotaSummary" -d '{}') && printf '%s' "$out" | jq -e ${shellQuote(GEMINI_GROUP_JQ)} >/dev/null 2>&1 && break`,
     `        out=""`,
     `      done`,
     `    fi`,
