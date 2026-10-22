@@ -21,6 +21,13 @@ export const ANTIGRAVITY_QUOTA_HOSTS = [
 // хостов, и аккаунт навсегда показывается как «нет данных».
 const GEMINI_GROUP_JQ = `[.groups[]? | (.displayName // ""), (.buckets[]?.bucketId // "")] | any(test("gemini"; "i"))`
 
+// 2026-10-22 Gemini-группа пропала из retrieveUserQuotaSummary на всех трёх
+// хостах у всех аккаунтов (остались только 3p-*). Квота Gemini осталась только
+// в fetchAvailableModels: по модели одно окно {remainingFraction, resetTime}.
+// На Mac везём лишь quotaInfo Gemini-моделей — полный ответ большой, а на
+// весь пул у ssh-буфера 1 МБ.
+const GEMINI_MODELS_JQ = `.models | with_entries(select(.key | test("gemini"; "i")) | .value |= {quotaInfo})`
+
 const SSH_TIMEOUT_MS = 30_000
 const SSH_MAX_BUFFER = 1024 * 1024
 
@@ -48,11 +55,15 @@ export type AntigravitySource = { dir: string } | { file: string }
  * 3×8 с (укладывается в SSH_TIMEOUT_MS = 30 с), а последовательно пул из 4 не
  * уложился бы. Каждый пишет в свой файл — ответ Google длиннее PIPE_BUF и в
  * общем stdout перемешался бы. На выходе по строке JSON на аккаунт:
- * {id: имя файла, quota: ответ | null}.
+ * {id: имя файла, quota: ответ | null, models?: quotaInfo Gemini-моделей}.
+ *
+ * Фолбэк идёт только на хост, который уже ответил 200 ($ok): если зависли все
+ * хосты, лишних 8 с не добавляется и аккаунт укладывается в SSH_TIMEOUT_MS.
  */
 export function buildRemoteScript(source: AntigravitySource): string {
   const hosts = ANTIGRAVITY_QUOTA_HOSTS.join(" ")
   const files = "dir" in source ? `${shellQuote(source.dir)}/antigravity-*.json` : shellQuote(source.file)
+  const curl = `curl -fsS -m 8 -H @- -H 'Content-Type: application/json' -A ${shellQuote(ANTIGRAVITY_USER_AGENT)} -X POST`
   return [
     `t=$(mktemp -d) || exit 5`,
     `trap 'rm -rf "$t"' EXIT`,
@@ -62,15 +73,23 @@ export function buildRemoteScript(source: AntigravitySource): string {
     `  i=$((i+1))`,
     `  (`,
     `    n=$(basename "$f")`,
-    `    tok=$( (sudo -n cat "$f" 2>/dev/null || cat "$f") | jq -r .access_token )`,
+    `    j=$(sudo -n cat "$f" 2>/dev/null || cat "$f")`,
+    `    tok=$(printf '%s' "$j" | jq -r .access_token)`,
     `    out=""`,
+    `    ok=""`,
+    `    models=""`,
     `    if [ -n "$tok" ] && [ "$tok" != "null" ]; then`,
     `      for h in ${hosts}; do`,
-    `        out=$(printf 'Authorization: Bearer %s\\n' "$tok" | curl -fsS -m 8 -H @- -H 'Content-Type: application/json' -A ${shellQuote(ANTIGRAVITY_USER_AGENT)} -X POST "https://$h/v1internal:retrieveUserQuotaSummary" -d '{}') && printf '%s' "$out" | jq -e ${shellQuote(GEMINI_GROUP_JQ)} >/dev/null 2>&1 && break`,
+    `        out=$(printf 'Authorization: Bearer %s\\n' "$tok" | ${curl} "https://$h/v1internal:retrieveUserQuotaSummary" -d '{}') && ok=\${ok:-$h} && printf '%s' "$out" | jq -e ${shellQuote(GEMINI_GROUP_JQ)} >/dev/null 2>&1 && break`,
     `        out=""`,
     `      done`,
+    `      if [ -z "$out" ] && [ -n "$ok" ]; then`,
+    `        body=$(printf '%s' "$j" | jq -c '{project: (.project_id // "")}')`,
+    `        models=$(printf 'Authorization: Bearer %s\\n' "$tok" | ${curl} "https://$ok/v1internal:fetchAvailableModels" -d "$body" | jq -c ${shellQuote(GEMINI_MODELS_JQ)} 2>/dev/null) || models=""`,
+    `      fi`,
     `    fi`,
     `    if [ -n "$out" ] && printf '%s' "$out" | jq -c --arg id "$n" '{id:$id,quota:.}' 2>/dev/null; then exit 0; fi`,
+    `    if [ -n "$models" ] && printf '%s' "$models" | jq -c --arg id "$n" '{id:$id,quota:null,models:.}' 2>/dev/null; then exit 0; fi`,
     `    jq -cn --arg id "$n" '{id:$id,quota:null}'`,
     `  ) > "$t/$i" &`,
     `done`,
@@ -131,6 +150,28 @@ export function parseQuotaSummary(raw: unknown): AntigravityQuota | null {
   return { groupName: stringField(gemini, "displayName"), fiveHour, weekly }
 }
 
+// fetchAvailableModels не говорит, какое окно (5h или weekly) сейчас ограничивает
+// модель. Различаем по сроку сброса: 5-часовое окно сбрасывается не позже чем
+// через 5 ч, запас 30 мин — на расхождение часов. Замер 2026-10-22: Pro-аккаунт
+// с остатком 0.95 — сброс через 2 ч, выбитый Ultra — через 45 ч.
+const FIVE_HOUR_HORIZON_MS = 5.5 * 60 * 60 * 1000
+
+export function parseAvailableModels(raw: unknown, now: number = Date.now()): AntigravityQuota | null {
+  if (!isRecord(raw)) return null
+  let worst: AntigravityWindow | null = null
+  for (const [id, model] of Object.entries(raw)) {
+    // У картиночных моделей своя квота (RATE_LIMIT_EXCEEDED отдельно от текстовых),
+    // в общее окно Gemini Flash/Pro они не входят.
+    if (!/gemini/i.test(id) || /image/i.test(id) || !isRecord(model) || !isRecord(model.quotaInfo)) continue
+    const w = toWindow(model.quotaInfo)
+    if (w && (worst === null || (w.usedPercent ?? 0) > (worst.usedPercent ?? 0))) worst = w
+  }
+  if (!worst) return null
+  const resetMs = worst.resetAt === null ? Number.NaN : Date.parse(worst.resetAt)
+  const isFiveHour = Number.isFinite(resetMs) && resetMs - now <= FIVE_HOUR_HORIZON_MS
+  return { groupName: "Gemini Models", fiveHour: isFiveHour ? worst : null, weekly: isFiveHour ? null : worst }
+}
+
 export function parseAccountLines(stdout: string): AntigravityAccount[] {
   const accounts: AntigravityAccount[] = []
   for (const line of stdout.split("\n")) {
@@ -142,7 +183,7 @@ export function parseAccountLines(stdout: string): AntigravityAccount[] {
       continue
     }
     if (!isRecord(rec) || typeof rec.id !== "string") continue
-    accounts.push({ id: accountIdFromFile(rec.id), quota: parseQuotaSummary(rec.quota) })
+    accounts.push({ id: accountIdFromFile(rec.id), quota: parseQuotaSummary(rec.quota) ?? parseAvailableModels(rec.models) })
   }
   return accounts.sort((a, b) => a.id.localeCompare(b.id))
 }

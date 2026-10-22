@@ -21,6 +21,7 @@ import {
   createAntigravityRefreshLoop,
   fetchAntigravityPool,
   parseAccountLines,
+  parseAvailableModels,
   parseQuotaSummary,
 } from "../antigravity-fetcher.js"
 import type { AntigravityAccount, AntigravityPool, AntigravityState } from "../types"
@@ -102,6 +103,11 @@ describe("buildRemoteScript", () => {
     expect(poolScript).toMatch(/^wait$/m)
   })
 
+  it("falls back to fetchAvailableModels with the account project on the host that answered", () => {
+    expect(poolScript).toContain(`"https://$ok/v1internal:fetchAvailableModels"`)
+    expect(poolScript).toContain("project_id")
+  })
+
   it("single-quotes a single auth file containing a quote", () => {
     expect(buildRemoteScript({ file: "/tmp/it's.json" })).toContain(`for f in '/tmp/it'\\''s.json'; do`)
   })
@@ -117,7 +123,63 @@ describe("accountIdFromFile", () => {
   })
 })
 
+// Срез живых ответов fetchAvailableModels от 2026-10-22 14:18Z.
+const NOW_MS = Date.parse("2026-10-22T14:18:00Z")
+const proModels = {
+  "gemini-3.8-flash-tiered": { quotaInfo: { remainingFraction: 0.9534614, resetTime: "2026-10-22T16:15:28Z" } },
+  "claude-sonnet-4-6": { quotaInfo: { remainingFraction: 0, resetTime: "2026-10-22T19:18:57Z" } },
+}
+const ultraOutModels = {
+  "gemini-3.8-flash-tiered": { quotaInfo: { resetTime: "2026-10-23T22:00:39Z" } },
+  "gemini-2.5-pro": { quotaInfo: { resetTime: "2026-10-23T22:00:39Z" } },
+  "claude-opus-5-5-high": { quotaInfo: { remainingFraction: 0.26085368, resetTime: "2026-10-26T10:52:00Z" } },
+}
+
+describe("parseAvailableModels", () => {
+  it("puts a reset within the 5h horizon into the five-hour window", () => {
+    const q = parseAvailableModels(proModels, NOW_MS)
+    expect(q?.groupName).toBe("Gemini Models")
+    expect(q?.fiveHour?.usedPercent).toBeCloseTo(4.65, 2)
+    expect(q?.fiveHour?.resetAt).toBe("2026-10-22T16:15:28Z")
+    expect(q?.weekly).toBeNull()
+  })
+
+  it("puts a far reset into the weekly window and treats a missing fraction as used up", () => {
+    const q = parseAvailableModels(ultraOutModels, NOW_MS)
+    expect(q?.weekly).toEqual({ usedPercent: 100, resetAt: "2026-10-23T22:00:39Z" })
+    expect(q?.fiveHour).toBeNull()
+  })
+
+  it("takes the most used gemini model and skips image and non-gemini models", () => {
+    const q = parseAvailableModels(
+      {
+        "gemini-3-flash": { quotaInfo: { remainingFraction: 0.8, resetTime: "2026-10-22T17:00:00Z" } },
+        "gemini-2.5-pro": { quotaInfo: { remainingFraction: 0.5, resetTime: "2026-10-22T16:00:00Z" } },
+        "gemini-3.1-flash-image": { quotaInfo: { resetTime: "2026-10-22T15:00:00Z" } },
+        "claude-opus-5-5-high": { quotaInfo: { resetTime: "2026-10-22T15:00:00Z" } },
+      },
+      NOW_MS,
+    )
+    expect(q?.fiveHour).toEqual({ usedPercent: 50, resetAt: "2026-10-22T16:00:00Z" })
+  })
+
+  it.each([
+    ["undefined", undefined],
+    ["null", null],
+    ["no gemini models", { "claude-sonnet-4-6": proModels["claude-sonnet-4-6"] }],
+    ["gemini without quotaInfo", { "gemini-3-flash": {} }],
+  ])("returns null for %s", (_name, raw) => {
+    expect(parseAvailableModels(raw, NOW_MS)).toBeNull()
+  })
+})
+
 describe("parseAccountLines", () => {
+  it("falls back to the models quota when the summary has no gemini group", () => {
+    const stdout = JSON.stringify({ id: "antigravity-ultra-acct@example.com.json", quota: null, models: ultraOutModels })
+    const [account] = parseAccountLines(stdout)
+    expect(account.quota?.weekly?.usedPercent).toBe(100)
+  })
+
   it("parses one JSON line per account, sorted by id, ignoring junk", () => {
     const stdout = [
       JSON.stringify({ id: "antigravity-ultra-acct@example.com.json", quota: realPayload }),
