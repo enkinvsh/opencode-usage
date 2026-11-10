@@ -54,12 +54,12 @@ function setup(daily: unknown, prod: unknown): void {
   chmodSync(join(bin, "sudo"), 0o755)
 }
 
-function run(): ReturnType<typeof parseAccountLines> {
+function run(now?: number): ReturnType<typeof parseAccountLines> {
   const stdout = execFileSync("sh", ["-c", buildRemoteScript({ dir: join(root, "auth") })], {
     env: { ...process.env, PATH: `${join(root, "bin")}:${process.env.PATH}`, FIXTURE_DIR: root },
     encoding: "utf8",
   })
-  return parseAccountLines(stdout)
+  return parseAccountLines(stdout, now)
 }
 
 beforeEach(() => {
@@ -88,5 +88,40 @@ describe("buildRemoteScript host fallback", () => {
   it("accepts the first host when it already has the Gemini group", () => {
     setup(geminiPayload, thirdPartyOnlyPayload)
     expect(run()[0]?.quota?.groupName).toBe("Gemini Models")
+  })
+
+  it("uses the account base_url host for fetchAvailableModels instead of fake $ok, falling back to $ok without base_url", () => {
+    setup(thirdPartyOnlyPayload, thirdPartyOnlyPayload)
+    writeFileSync(
+      join(root, "auth", "antigravity-acct-b@example.com.json"),
+      JSON.stringify({ access_token: "tok", base_url: "https://daily-cloudcode-pa.googleapis.com", project_id: "p1" }),
+    )
+    writeFileSync(
+      join(root, "prod-models.json"),
+      JSON.stringify({ models: { "gemini-2.5-pro": { quotaInfo: { remainingFraction: 1, resetTime: "2026-11-11T00:00:00Z" } } } }),
+    )
+    writeFileSync(
+      join(root, "daily-models.json"),
+      JSON.stringify({ models: { "gemini-2.5-pro": { quotaInfo: { remainingFraction: 0.7, resetTime: "2026-11-10T20:10:25Z" } } } }),
+    )
+    writeFileSync(
+      join(root, "bin", "curl"),
+      [
+        "#!/bin/sh",
+        "cat >/dev/null",
+        'for a in "$@"; do case "$a" in https://*) url=$a;; esac; done',
+        'case "$url" in',
+        '  https://cloudcode-pa.googleapis.com/*:fetchAvailableModels) cat "$FIXTURE_DIR/prod-models.json";;',
+        '  https://daily-cloudcode-pa.googleapis.com/*:fetchAvailableModels) cat "$FIXTURE_DIR/daily-models.json";;',
+        '  https://cloudcode-pa.googleapis.com/*) cat "$FIXTURE_DIR/prod.json";;',
+        '  *) cat "$FIXTURE_DIR/daily.json";;',
+        "esac",
+      ].join("\n"),
+    )
+    chmodSync(join(root, "bin", "curl"), 0o755)
+
+    const accounts = run(Date.parse("2026-11-10T19:00:00Z"))
+    expect(accounts.find((a) => a.id === "acct-a")?.quota?.fiveHour?.usedPercent).toBe(0)
+    expect(accounts.find((a) => a.id === "acct-b")?.quota?.fiveHour?.usedPercent).toBeCloseTo(30, 5)
   })
 })

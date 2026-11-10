@@ -103,8 +103,10 @@ describe("buildRemoteScript", () => {
     expect(poolScript).toMatch(/^wait$/m)
   })
 
-  it("falls back to fetchAvailableModels with the account project on the host that answered", () => {
-    expect(poolScript).toContain(`"https://$ok/v1internal:fetchAvailableModels"`)
+  it("falls back to fetchAvailableModels on the account base_url host (or $ok if missing)", () => {
+    expect(poolScript).toContain(".base_url")
+    expect(poolScript).toContain("mh=${mh:-$ok}")
+    expect(poolScript).toContain(`"https://$mh/v1internal:fetchAvailableModels"`)
     expect(poolScript).toContain("project_id")
   })
 
@@ -176,7 +178,7 @@ describe("parseAvailableModels", () => {
 describe("parseAccountLines", () => {
   it("falls back to the models quota when the summary has no gemini group", () => {
     const stdout = JSON.stringify({ id: "antigravity-ultra-acct@example.com.json", quota: null, models: ultraOutModels })
-    const [account] = parseAccountLines(stdout)
+    const [account] = parseAccountLines(stdout, NOW_MS)
     expect(account.quota?.weekly?.usedPercent).toBe(100)
   })
 

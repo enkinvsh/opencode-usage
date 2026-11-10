@@ -57,8 +57,12 @@ export type AntigravitySource = { dir: string } | { file: string }
  * общем stdout перемешался бы. На выходе по строке JSON на аккаунт:
  * {id: имя файла, quota: ответ | null, models?: quotaInfo Gemini-моделей}.
  *
- * Фолбэк идёт только на хост, который уже ответил 200 ($ok): если зависли все
- * хосты, лишних 8 с не добавляется и аккаунт укладывается в SSH_TIMEOUT_MS.
+ * Фолбэк запускается, только если хотя бы один хост ответил 200 ($ok): когда
+ * все хосты зависли (3×8 с) или токен протух (401), лишний вызов выбил бы
+ * SSH_TIMEOUT_MS = 30 с. Сам fetchAvailableModels бьёт в base_url аккаунта
+ * (хост, через который прокси шлёт трафик; $ok — только если base_url нет):
+ * 2026-11-10 прод cloudcode-pa отвечает 200 с 3p-*, а в fetchAvailableModels
+ * отдаёт фейковый remainingFraction=1 со скользящим resetTime (now+5h).
  */
 export function buildRemoteScript(source: AntigravitySource): string {
   const hosts = ANTIGRAVITY_QUOTA_HOSTS.join(" ")
@@ -84,8 +88,10 @@ export function buildRemoteScript(source: AntigravitySource): string {
     `        out=""`,
     `      done`,
     `      if [ -z "$out" ] && [ -n "$ok" ]; then`,
+    `        mh=$(printf '%s' "$j" | jq -r '.base_url | strings | sub("^https?://"; "") | sub("/.*$"; "")')`,
+    `        mh=\${mh:-$ok}`,
     `        body=$(printf '%s' "$j" | jq -c '{project: (.project_id // "")}')`,
-    `        models=$(printf 'Authorization: Bearer %s\\n' "$tok" | ${curl} "https://$ok/v1internal:fetchAvailableModels" -d "$body" | jq -c ${shellQuote(GEMINI_MODELS_JQ)} 2>/dev/null) || models=""`,
+    `        models=$(printf 'Authorization: Bearer %s\\n' "$tok" | ${curl} "https://$mh/v1internal:fetchAvailableModels" -d "$body" | jq -c ${shellQuote(GEMINI_MODELS_JQ)} 2>/dev/null) || models=""`,
     `      fi`,
     `    fi`,
     `    if [ -n "$out" ] && printf '%s' "$out" | jq -c --arg id "$n" '{id:$id,quota:.}' 2>/dev/null; then exit 0; fi`,
@@ -172,7 +178,7 @@ export function parseAvailableModels(raw: unknown, now: number = Date.now()): An
   return { groupName: "Gemini Models", fiveHour: isFiveHour ? worst : null, weekly: isFiveHour ? null : worst }
 }
 
-export function parseAccountLines(stdout: string): AntigravityAccount[] {
+export function parseAccountLines(stdout: string, now: number = Date.now()): AntigravityAccount[] {
   const accounts: AntigravityAccount[] = []
   for (const line of stdout.split("\n")) {
     let rec: unknown
@@ -183,7 +189,7 @@ export function parseAccountLines(stdout: string): AntigravityAccount[] {
       continue
     }
     if (!isRecord(rec) || typeof rec.id !== "string") continue
-    accounts.push({ id: accountIdFromFile(rec.id), quota: parseQuotaSummary(rec.quota) ?? parseAvailableModels(rec.models) })
+    accounts.push({ id: accountIdFromFile(rec.id), quota: parseQuotaSummary(rec.quota) ?? parseAvailableModels(rec.models, now) })
   }
   return accounts.sort((a, b) => a.id.localeCompare(b.id))
 }

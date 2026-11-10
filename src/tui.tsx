@@ -346,9 +346,10 @@ const tui: TuiPlugin = async (api, rawOptions, _meta) => {
           )
         }
 
-        // 14 вмещает и самое длинное имя (acct-alpha-01, 13), и «ultra-acct · U» (14),
-        // чтобы колонки S и W стояли ровно.
-        const ACCOUNT_NAME_WIDTH = 14
+        // 20 вмещает 16-символьное имя с пометкой Ultra («truongquangtt134 · U», 20),
+        // чтобы имя не резалось и колонки S и W стояли ровно; вся строка — 36 символов
+        // при ширине сайдбара ~38.
+        const ACCOUNT_NAME_WIDTH = 20
         const ULTRA_SUFFIX = " \u00B7 U"
 
         const renderAntigravityAccount = (a: AntigravityAccount) => {
